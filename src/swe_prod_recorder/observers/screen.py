@@ -555,12 +555,38 @@ class Screen(Observer):
                 )
 
                 if not window_exists:
-                    # Window is actually closed - mark as closed
+                    miss_count = tracked.get("_missing_checks", 0) + 1
+                    tracked["_missing_checks"] = miss_count
+
+                    # If we've never successfully resolved this window via CGWindowList,
+                    # assume permissions are restricting visibility and keep the static region.
+                    if not tracked.get("_ever_seen"):
+                        any_window_open = True
+                        if miss_count == 1:
+                            logging.getLogger("Screen").warning(
+                                "Window ID %s not visible via CGWindowList; "
+                                "retaining the selected region. If recording stops instantly, "
+                                "verify Screen Recording/Input Monitoring permissions for the Python interpreter.",
+                                tracked["id"],
+                            )
+                        continue
+
+                    # Once we've seen the window at least once, tolerate a few misses
+                    # (e.g., rapid Space changes) before declaring it closed.
+                    if miss_count < 10:
+                        any_window_open = True
+                        continue
+
                     tracked["region"] = None
                     logging.getLogger("Screen").warning(
-                        f"Tracked window (ID: {tracked['id']}) closed - removed from tracking"
+                        "Tracked window (ID: %s) closed or unavailable after %d consecutive checks",
+                        tracked["id"],
+                        miss_count,
                     )
                     continue
+
+                tracked["_ever_seen"] = True
+                tracked.pop("_missing_checks", None)
 
                 # Window exists but may not be visible (minimized, different Space, etc.)
                 any_window_open = True

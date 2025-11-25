@@ -70,6 +70,14 @@ options:
                         Stop recording after N minutes of inactivity (default: 45)
 ```
 
+**IMPORTANT**: If you are running macOS Tahoe 26.X, please use the following command instead.
+
+```bash
+swe-prod-recorder --record-all-screens
+```
+
+There is a known issue in this OS version that causes the screen recorder to fail silently. This command will record your full screen during interactions, so please make sure to close all personal files prior to recording.
+
 ## Data Layout
 
 - `config/` – Configuration files
