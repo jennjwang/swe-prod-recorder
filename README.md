@@ -70,6 +70,15 @@ options:
                         Stop recording after N minutes of inactivity (default: 45)
 ```
 
+### Window Selection
+
+When the recorder starts, you'll see an overlay for selecting which windows to record:
+
+1. **Click on windows** to select them (they turn GREEN)
+2. **Click selected windows again** to deselect them
+3. **Press ENTER** or click the green DONE button to start recording
+4. **Press Ctrl+C** to cancel
+
 **IMPORTANT**: If you are running macOS Tahoe 26.X, please use the following command instead.
 
 ```bash
