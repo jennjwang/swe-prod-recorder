@@ -136,25 +136,21 @@ class SelectionView(AppKit.NSView):
         global _selected_regions, _selected_window_ids, _selection_confirmed, _selection_cancelled
         keyCode = event.keyCode()
         modifiers = event.modifierFlags()
-        print(f"Key pressed: keyCode={keyCode}, modifiers={modifiers}")
 
-        # ESC or Ctrl+C = cancel
+        # Ctrl+C = cancel
         is_ctrl_c = keyCode == 8 and (modifiers & AppKit.NSEventModifierFlagControl)
-        if keyCode == 53 or is_ctrl_c:  # kVK_Escape or Ctrl+C
-            print("ESC/Ctrl+C pressed - cancelling")
+        if is_ctrl_c:
+            print("Ctrl+C pressed - cancelling")
             _selected_regions = []
             _selected_window_ids = []
             _selection_cancelled = True
             self._close_all_overlays()
             return
 
-        # Enter/Return = confirm selection
+        # Enter or Return = confirm selection
         elif keyCode == 36 or keyCode == 76:  # kVK_Return or kVK_KeypadEnter
-            print(
-                f"Enter pressed - selected_windows count: {len(self.selected_windows)}"
-            )
             if self.selected_windows:
-                # Use the selected windows
+                print(f"ENTER pressed - confirming selection of {len(self.selected_windows)} window(s)")
                 _selected_regions = [w.copy() for w in self.selected_windows]
                 _selected_window_ids = [
                     w.get("window_id") for w in self.selected_windows
@@ -162,10 +158,6 @@ class SelectionView(AppKit.NSView):
                 # Remove window_id from regions as it's stored separately
                 for region in _selected_regions:
                     region.pop("window_id", None)
-                print(f"Confirming selection of {len(self.selected_windows)} window(s)")
-                print(
-                    f"Setting global _selected_regions to {len(_selected_regions)} items"
-                )
                 _selection_confirmed = True
                 self._close_all_overlays()
             else:
@@ -585,7 +577,7 @@ class SelectionView(AppKit.NSView):
             )
 
             # Draw instruction text (in bottom banner, left side)
-            text_str = "Click windows to toggle  •  Ctrl+C to cancel"
+            text_str = "Click windows to toggle  •  Press ENTER or click DONE to start  •  Ctrl+C to cancel"
             text = AppKit.NSString.stringWithString_(text_str)
             attrs = {
                 AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(14),
@@ -691,11 +683,35 @@ def select_region_with_mouse() -> tuple[list[dict], list[int | None]]:
     print("=" * 70)
     print("1. Click on windows to SELECT them (they turn GREEN)")
     print("2. Click selected windows again to DESELECT them")
-    print("3. Click the green DONE button (in bottom banner on primary monitor) to confirm")
-    print("4. Press ENTER to confirm or ESC/Ctrl+C to cancel")
+    print("3. Press ENTER or click the green DONE button to start recording")
+    print("4. Press Ctrl+C to cancel")
     print("=" * 70 + "\n")
 
     AppKit.NSCursor.crosshairCursor().push()
+
+    # Set up global keyboard monitor for ENTER key (works without window focus)
+    def keyboard_handler(event):
+        global _selected_regions, _selected_window_ids, _selection_confirmed, _shared_selected_windows
+        keyCode = event.keyCode()
+
+        if keyCode == 36 or keyCode == 76:  # kVK_Return or kVK_KeypadEnter
+            if _shared_selected_windows:
+                print(f"ENTER pressed - confirming selection of {len(_shared_selected_windows)} window(s)")
+                _selected_regions = [w.copy() for w in _shared_selected_windows]
+                _selected_window_ids = [w.get("window_id") for w in _shared_selected_windows]
+                for region in _selected_regions:
+                    region.pop("window_id", None)
+                _selection_confirmed = True
+            else:
+                print("No windows selected. Please click windows to select them first.")
+        return event
+
+    # Install global keyboard monitor
+    monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+        AppKit.NSEventMaskKeyDown,
+        keyboard_handler
+    )
+
     try:
         # Run custom event loop until user confirms or cancels
         while not _selection_confirmed and not _selection_cancelled:
@@ -711,9 +727,14 @@ def select_region_with_mouse() -> tuple[list[dict], list[int | None]]:
                 app.sendEvent_(event)
                 app.updateWindows()
 
-        print(f"Selection completed: confirmed={_selection_confirmed}, cancelled={_selection_cancelled}")
-
     finally:
+        # Remove global keyboard monitor
+        if monitor:
+            try:
+                AppKit.NSEvent.removeMonitor_(monitor)
+            except Exception:
+                pass
+
         # Always restore cursor
         try:
             AppKit.NSCursor.pop()
