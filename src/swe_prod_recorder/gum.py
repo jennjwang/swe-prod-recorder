@@ -129,6 +129,7 @@ class gum:
                 observer_name=observer.name,
                 content=update.content,
                 content_type=update.content_type,
+                event_ts=update.event_ts,
             )
 
             if await self._handle_audit(observation):

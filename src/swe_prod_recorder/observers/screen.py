@@ -955,6 +955,7 @@ class Screen(Observer):
         highlight: bool = True,
         box_color: str = "red",
         box_width: int = 10,
+        event_ts: float | None = None,
     ) -> str:
         """
         Save a frame with bounding box and crosshair at the given position.
@@ -976,7 +977,8 @@ class Screen(Observer):
         box_width : int
             Width of bounding box outline
         """
-        ts = f"{time.time():.5f}"
+        ts_value = event_ts if event_ts is not None else time.time()
+        ts = f"{ts_value:.5f}"
         path = os.path.join(self.screens_dir, f"{ts}_{tag}.jpg")
         image = Image.frombytes("RGB", (frame.width, frame.height), frame.rgb)
         draw = ImageDraw.Draw(image)
@@ -1060,18 +1062,25 @@ class Screen(Observer):
         after_path: str | None,
         action: str | None,
         ev: dict | None,
+        event_ts: float | None = None,
     ) -> None:
         if "scroll" in action:
             # Include scroll delta information
             scroll_info = ev.get("scroll", (0, 0))
             step = f"scroll({ev['position'][0]:.1f}, {ev['position'][1]:.1f}, dx={scroll_info[0]:.2f}, dy={scroll_info[1]:.2f})"
-            await self.update_queue.put(Update(content=step, content_type="input_text"))
+            await self.update_queue.put(
+                Update(content=step, content_type="input_text", event_ts=event_ts)
+            )
         elif "click" in action:
             step = f"{action}({ev['position'][0]:.1f}, {ev['position'][1]:.1f})"
-            await self.update_queue.put(Update(content=step, content_type="input_text"))
+            await self.update_queue.put(
+                Update(content=step, content_type="input_text", event_ts=event_ts)
+            )
         else:
             step = f"{action}({ev['text']})"
-            await self.update_queue.put(Update(content=step, content_type="input_text"))
+            await self.update_queue.put(
+                Update(content=step, content_type="input_text", event_ts=event_ts)
+            )
 
     async def stop(self) -> None:
         """Stop the observer and clean up resources."""
@@ -1224,6 +1233,7 @@ class Screen(Observer):
                 ev = self._pending_event
                 # Clear pending event immediately to avoid blocking next event
                 self._pending_event = None
+                event_ts = ev.get("event_ts")
 
                 # Update tracked regions before capturing "after" frame
                 await self._update_tracked_regions()
@@ -1260,11 +1270,19 @@ class Screen(Observer):
                     ev["position"][0],
                     ev["position"][1],
                     f"{step}_before",
+                    event_ts=event_ts,
                 )
                 aft_path = await self._save_frame(
-                    aft, mon_rect, ev["position"][0], ev["position"][1], f"{step}_after"
+                    aft,
+                    mon_rect,
+                    ev["position"][0],
+                    ev["position"][1],
+                    f"{step}_after",
+                    event_ts=event_ts,
                 )
-                await self._process_and_emit(bef_path, aft_path, ev["type"], ev)
+                await self._process_and_emit(
+                    bef_path, aft_path, ev["type"], ev, event_ts=event_ts
+                )
 
                 log.info(f"{ev['type']} captured on window {ev['mon']}")
 
@@ -1333,6 +1351,7 @@ class Screen(Observer):
                 # Update activity timestamp
                 await self._update_activity_time()
 
+                event_ts = time.time()
                 rel_x = x - mon["left"]
                 rel_y = mon["top"] + mon["height"] - screen_y
                 log.info(
@@ -1344,6 +1363,7 @@ class Screen(Observer):
                     "mon": idx,
                     "before": bf,
                     "monitor_rect": mon,
+                    "event_ts": event_ts,
                 }
                 return
 
@@ -1389,9 +1409,10 @@ class Screen(Observer):
                 # Update activity timestamp
                 await self._update_activity_time()
 
+                event_ts = time.time()
                 step = f"key_{typ}({str(key)})"
                 await self.update_queue.put(
-                    Update(content=step, content_type="input_text")
+                    Update(content=step, content_type="input_text", event_ts=event_ts)
                 )
 
                 async with self._key_activity_lock:
@@ -1403,13 +1424,18 @@ class Screen(Observer):
                         or current_time - self._key_activity_start
                         > self._key_activity_timeout
                     ):
-                        # Start new session - save first screenshot
+                    # Start new session - save first screenshot
                         self._key_activity_start = current_time
                         self._key_screenshots = []
 
                         # Save frame
                         screenshot_path = await self._save_frame(
-                            frame, mon, rel_x, rel_y, f"{step}_first"
+                            frame,
+                            mon,
+                            rel_x,
+                            rel_y,
+                            f"{step}_first",
+                            event_ts=event_ts,
                         )
                         self._key_screenshots.append(screenshot_path)
                         log.info(
@@ -1418,7 +1444,13 @@ class Screen(Observer):
                     else:
                         # Continue existing session - save intermediate screenshot
                         screenshot_path = await self._save_frame(
-                            frame, mon, rel_x, rel_y, f"{step}_intermediate", highlight=False
+                            frame,
+                            mon,
+                            rel_x,
+                            rel_y,
+                            f"{step}_intermediate",
+                            highlight=False,
+                            event_ts=event_ts,
                         )
                         self._key_screenshots.append(screenshot_path)
                         log.info(
@@ -1487,6 +1519,7 @@ class Screen(Observer):
                 # Update activity timestamp
                 await self._update_activity_time()
 
+                event_ts = time.time()
                 self._pending_event = {
                     "type": "scroll",
                     "position": (rel_x, rel_y),
@@ -1494,6 +1527,7 @@ class Screen(Observer):
                     "before": bf,
                     "scroll": (dx, dy),
                     "monitor_rect": mon,
+                    "event_ts": event_ts,
                 }
 
                 # Process event immediately
