@@ -85,7 +85,7 @@ When the recorder starts, you'll see an overlay for selecting which windows to r
 swe-prod-recorder --record-all-screens
 ```
 
-There is a known issue in this OS version that causes the screen recorder to fail silently. This command will record your full screen during interactions, so please make sure to close all personal files prior to recording.
+There is a known issue that leads the screen recorder to fail after the window selection in this OS version. This command will record your full screen during interactions, so please make sure to close all personal files prior to recording.
 
 ## Data Layout
 
