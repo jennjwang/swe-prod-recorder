@@ -104,7 +104,7 @@ def _get_visible_windows() -> List[tuple[dict, float]]:
 
     for info in wins:
         owner = info.get("kCGWindowOwnerName", "")
-        if owner in ("Dock", "WindowServer", "Window Server"):
+        if owner in ("Dock", "WindowServer", "Window Server", "Notification Center", "NotificationCenter"):
             continue
 
         bounds = info.get("kCGWindowBounds", {})
@@ -696,7 +696,7 @@ class Screen(Observer):
 
                 # Skip system UI elements
                 is_menubar = layer == Quartz.CGWindowLevelForKey(Quartz.kCGMainMenuWindowLevelKey)
-                is_system = owner in ("Dock", "WindowServer", "Window Server")
+                is_system = owner in ("Dock", "WindowServer", "Window Server", "Notification Center", "NotificationCenter")
 
                 if not is_system and not is_menubar:
                     if self.debug:
@@ -730,6 +730,7 @@ class Screen(Observer):
                 if self.debug:
                     logging.getLogger("Screen").debug("Point is within region bounds")
                 # If this is a tracked window (has window_id), verify owner matches
+                # print(tracked)
                 if tracked["id"] is not None and tracked.get("owner"):
                     topmost_id, topmost_owner = self._get_topmost_window_at_point(x, y)
                     if self.debug:
@@ -874,6 +875,10 @@ class Screen(Observer):
             folder = drive.CreateFile({"id": folder_spec})
             folder.FetchMetadata()
             if folder.get("mimeType") == "application/vnd.google-apps.folder":
+                if self.debug:
+                    logging.getLogger("Screen").info(
+                        "Using existing Google Drive folder ID '%s'", folder_spec
+                    )
                 return folder_spec
         except Exception:
             pass
@@ -881,6 +886,10 @@ class Screen(Observer):
         # Next, try to find by name.
         folder_id = find_folder_by_name(folder_spec, drive)
         if folder_id:
+            if self.debug:
+                logging.getLogger("Screen").info(
+                    "Found existing Google Drive folder '%s' with ID %s", folder_spec, folder_id
+                )
             return folder_id
 
         # Create the folder if it doesn't exist (one level deep).
@@ -893,7 +902,7 @@ class Screen(Observer):
         folder.Upload()
         if self.debug:
             logging.getLogger("Screen").info(
-                "Created Google Drive folder '%s' with id %s", folder_spec, folder["id"]
+                "Created new Google Drive folder '%s' with ID %s", folder_spec, folder["id"]
             )
         return folder["id"]
 
@@ -958,7 +967,7 @@ class Screen(Observer):
         event_ts: float | None = None,
     ) -> str:
         """
-        Save a frame with bounding box and crosshair at the given position.
+        Save a frame with a cursor highlight at the given position.
 
         Parameters
         ----------
@@ -973,7 +982,7 @@ class Screen(Observer):
         highlight : bool
             When False, skip drawing the highlight overlays
         box_color : str
-            Color for bounding box and crosshair
+            Color for the cursor highlight
         box_width : int
             Width of bounding box outline
         """
@@ -1005,36 +1014,22 @@ class Screen(Observer):
         y_pixel = max(0, min(frame.height - 1, y_pixel))
 
         if highlight:
-            # Calculate bounding box with smaller, more precise padding
-            # Use average scale for box size to handle non-uniform scaling
+            # Calculate a compact cursor box based on actual frame scale
             avg_scale = (scale_x + scale_y) / 2.0
-            box_size = int(30 * avg_scale)  # 30 logical points
-            x1 = max(0, x_pixel - box_size)
-            x2 = min(frame.width, x_pixel + box_size)
-            y1 = max(0, y_pixel - box_size)
-            y2 = min(frame.height, y_pixel + box_size)
+            cursor_box_half = max(3, int(6 * avg_scale))  # ~12 logical points overall
+            x1 = max(0, x_pixel - cursor_box_half)
+            x2 = min(frame.width, x_pixel + cursor_box_half)
+            y1 = max(0, y_pixel - cursor_box_half)
+            y2 = min(frame.height, y_pixel + cursor_box_half)
 
             # Draw the bounding box if coordinates are valid
             if x1 < x2 and y1 < y2:
-                draw.rectangle([x1, y1, x2, y2], outline=box_color, width=box_width)
-
-            # Draw a crosshair at the exact mouse position
-            crosshair_size = int(15 * avg_scale)  # 15 logical points
-            crosshair_width = max(2, int(3 * avg_scale))
-
-            # Horizontal line
-            h_x1 = max(0, x_pixel - crosshair_size)
-            h_x2 = min(frame.width, x_pixel + crosshair_size)
-            draw.line(
-                [(h_x1, y_pixel), (h_x2, y_pixel)], fill=box_color, width=crosshair_width
-            )
-
-            # Vertical line
-            v_y1 = max(0, y_pixel - crosshair_size)
-            v_y2 = min(frame.height, y_pixel + crosshair_size)
-            draw.line(
-                [(x_pixel, v_y1), (x_pixel, v_y2)], fill=box_color, width=crosshair_width
-            )
+                cursor_box_outline = max(2, int(max(1, box_width // 4) * avg_scale))
+                draw.rectangle(
+                    [x1, y1, x2, y2],
+                    outline=box_color,
+                    width=cursor_box_outline,
+                )
 
         # Save with lower quality to reduce memory usage and disk I/O
         await self._run_in_thread(
@@ -1320,6 +1315,7 @@ class Screen(Observer):
 
                 # Check if point is in any of our tracked windows/regions
                 tracked = self._find_region_for_point(x, screen_y)
+                # print(tracked)
                 if tracked is None:
                     if self.debug:
                         log.info(

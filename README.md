@@ -58,6 +58,7 @@ usage: swe-prod-recorder [-h]
                          [--upload-to-gdrive]
                          [--record-all-screens]
                          [--inactivity-timeout INACTIVITY_TIMEOUT]
+                         [--pr PR]
 
 SWE Productivity Recorder - Screen activity recorder for software engineer
 productivity research
@@ -68,6 +69,7 @@ options:
   --record-all-screens  Record all monitors/screens (no window selection needed)
   --inactivity-timeout INACTIVITY_TIMEOUT
                         Stop recording after N minutes of inactivity (default: 45)
+  --pr PR         PR number to organize screen recording data under data/pr_{pr}
 ```
 
 ### Window Selection
@@ -99,11 +101,37 @@ There is a known issue that leads the screen recorder to fail after the window s
   - `screenshots/` – Timestamped screenshots
     - **Without `--upload-to-gdrive`**: Stored locally and kept permanently
     - **With `--upload-to-gdrive`**: Uploaded to Google Drive and deleted locally
+  - `pr_{N}/` – PR-specific directories (when using `--pr` flag)
+    - `actions.db` – SQLite database for this pr
+    - `screenshots/` – Screenshots for this pr
+
+### Organizing Data by PR
+
+Use the `--pr` flag to organize recordings by pr number:
+
+```bash
+swe-prod-recorder --pr 1
+```
+
+This saves all data under `data/pr_1/` instead of `data/`, making it easy to keep recordings from different prs separate. The directory structure will be:
+
+```
+data/
+├── pr_1/
+│   ├── actions.db
+│   └── screenshots/
+├── pr_2/
+│   ├── actions.db
+│   └── screenshots/
+└── ...
+```
 
 You can inspect the database with:
 
 ```bash
 sqlite3 data/actions.db '.tables'
+# Or for a specific pr:
+sqlite3 data/pr_1/actions.db '.tables'
 ```
 
 ## Google Drive Uploads

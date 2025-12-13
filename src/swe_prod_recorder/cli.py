@@ -55,15 +55,21 @@ def parse_args():
         help="Enable debug logging",
     )
 
+    parser.add_argument(
+        "--pr",
+        type=int,
+        required=False,
+        help="PR number to organize screen recording data under data/pr_{pr}",
+    )
+
     return parser.parse_args()
 
 
-async def _async_main(screen_observer, stop_event):
+async def _async_main(screen_observer, stop_event, data_directory):
     """Run async event loop in background thread.
 
     This manages the database, observer workers, and update processing.
     """
-    data_directory = "data"
     user_name = "anonymous"  # Default user name
 
     try:
@@ -153,7 +159,16 @@ def main():
     print("\n" + "=" * 70)
 
     input("\nPress Enter to confirm and start recording...")
-    print("\nStarting recording...\n")
+    # print("\nStarting recording...\n")
+
+    # Set data directory based on PR number
+    if args.pr is not None:
+        data_directory = f"data/pr_{args.pr}"
+        screenshots_dir = f"{data_directory}/screenshots"
+        print(f"\n📁 Data will be saved to: {data_directory}/")
+    else:
+        data_directory = "data"
+        screenshots_dir = "data/screenshots"
 
     # Create screen observer (window selection happens on main thread)
     screen_observer = Screen(
@@ -162,6 +177,7 @@ def main():
         inactivity_timeout=args.inactivity_timeout * 60,
         debug=args.debug,
         start_listeners_on_main_thread=True,  # macOS-safe mode
+        screenshots_dir=screenshots_dir,
     )
 
     # Coordination between main and background threads
@@ -169,7 +185,7 @@ def main():
 
     # Launch asyncio event loop in background thread
     async_thread = threading.Thread(
-        target=lambda: asyncio.run(_async_main(screen_observer, stop_event)),
+        target=lambda: asyncio.run(_async_main(screen_observer, stop_event, data_directory)),
         daemon=True,
         name="AsyncIOThread"
     )
