@@ -58,8 +58,8 @@ def parse_args():
     parser.add_argument(
         "--pr",
         type=int,
-        required=False,
-        help="PR number to organize screen recording data under data/pr_{pr}",
+        required=True,
+        help="PR number to organize screen recording data under data/pr_{pr} (use issue number if PRs are not available yet, or 0 for onboarding)",
     )
 
     return parser.parse_args()
@@ -162,13 +162,9 @@ def main():
     # print("\nStarting recording...\n")
 
     # Set data directory based on PR number
-    if args.pr is not None:
-        data_directory = f"data/pr_{args.pr}"
-        screenshots_dir = f"{data_directory}/screenshots"
-        print(f"\n📁 Data will be saved to: {data_directory}/")
-    else:
-        data_directory = "data"
-        screenshots_dir = "data/screenshots"
+    data_directory = f"data/pr_{args.pr}"
+    screenshots_dir = f"{data_directory}/screenshots"
+    print(f"\n📁 Data will be saved to: {data_directory}/")
 
     # Create screen observer (window selection happens on main thread)
     screen_observer = Screen(

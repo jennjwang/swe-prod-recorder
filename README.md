@@ -58,7 +58,7 @@ usage: swe-prod-recorder [-h]
                          [--upload-to-gdrive]
                          [--record-all-screens]
                          [--inactivity-timeout INACTIVITY_TIMEOUT]
-                         [--pr PR]
+                         --pr PR
 
 SWE Productivity Recorder - Screen activity recorder for software engineer
 productivity research
@@ -69,7 +69,7 @@ options:
   --record-all-screens  Record all monitors/screens (no window selection needed)
   --inactivity-timeout INACTIVITY_TIMEOUT
                         Stop recording after N minutes of inactivity (default: 45)
-  --pr PR         PR number to organize screen recording data under data/pr_{pr}
+  --pr PR               PR number to organize screen recording data under data/pr_{pr} (required; use issue number if PRs are not available yet, or 0 for onboarding)
 ```
 
 ### Window Selection
@@ -107,13 +107,13 @@ There is a known issue that leads the screen recorder to fail after the window s
 
 ### Organizing Data by PR
 
-Use the `--pr` flag to organize recordings by pr number:
+The `--pr` flag is required to organize recordings by PR number (use issue number if PRs are not available yet, or 0 for onboarding):
 
 ```bash
 swe-prod-recorder --pr 1
 ```
 
-This saves all data under `data/pr_1/` instead of `data/`, making it easy to keep recordings from different prs separate. The directory structure will be:
+This saves all data under `data/pr_1/` instead of `data/`, making it easy to keep recordings from different PRs/issues separate. For onboarding sessions, use `--pr 0` which will save data under `data/pr_0/`. The directory structure will be:
 
 ```
 data/
