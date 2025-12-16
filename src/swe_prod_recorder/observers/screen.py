@@ -623,6 +623,14 @@ class Screen(Observer):
             self._thread_pool, lambda: func(*args, **kwargs)
         )
 
+    def _grab_screenshot(self, mss_rect: dict):
+        """Thread-safe screenshot capture using mss.
+        
+        Creates a new mss instance per thread to avoid thread-local storage issues.
+        """
+        with mss.mss() as sct:
+            return sct.grab(mss_rect)
+
     def _detect_high_dpi(self) -> bool:
         """Detect if running on a high-DPI display and adjust settings."""
         try:
@@ -1030,502 +1038,503 @@ class Screen(Observer):
 
         # ------------------------------------------------------------------
         # All calls to mss / Quartz are wrapped in `to_thread`
+        # Note: mss instances are created per-thread in _grab_screenshot()
+        # to avoid thread-local storage issues
         # ------------------------------------------------------------------
-        with mss.mss() as sct:
-            # Initialize mons list - will be updated dynamically for tracked windows
-            if self._tracked_windows:
-                # Use the tracked windows/regions
-                if self.debug:
-                    log.info(
-                        f"Recording {len(self._tracked_windows)} window(s)/region(s)"
-                    )
-            else:
-                # Use all monitors (backward compatibility)
-                if self.debug:
-                    log.info(f"Recording all monitors")
+        # Initialize mons list - will be updated dynamically for tracked windows
+        if self._tracked_windows:
+            # Use the tracked windows/regions
+            if self.debug:
+                log.info(
+                    f"Recording {len(self._tracked_windows)} window(s)/region(s)"
+                )
+        else:
+            # Use all monitors (backward compatibility)
+            if self.debug:
+                log.info(f"Recording all monitors")
 
-            # Create and start listeners if not using main thread mode
-            if not self._start_listeners_on_main_thread:
-                if not self._listeners_started:
-                    self._mouse_listener = self._mouse_listener_factory()
-                    self._key_listener = self._key_listener_factory()
-
-                    # Brief delay to let AppKit modal state settle after window selection
-                    await asyncio.sleep(0.1)
-
-                    self._mouse_listener.start()
-                    self._key_listener.start()
-                    self._listeners_started = True
-
-            # Wait for listeners to be started (might be on main thread)
-            wait_time = 0
-            while not self._listeners_started and wait_time < 10:
-                await asyncio.sleep(0.1)
-                wait_time += 0.1
-
+        # Create and start listeners if not using main thread mode
+        if not self._start_listeners_on_main_thread:
             if not self._listeners_started:
-                log.error("Listeners not started after 10 seconds")
+                self._mouse_listener = self._mouse_listener_factory()
+                self._key_listener = self._key_listener_factory()
+
+                # Brief delay to let AppKit modal state settle after window selection
+                await asyncio.sleep(0.1)
+
+                self._mouse_listener.start()
+                self._key_listener.start()
+                self._listeners_started = True
+
+        # Wait for listeners to be started (might be on main thread)
+        wait_time = 0
+        while not self._listeners_started and wait_time < 10:
+            await asyncio.sleep(0.1)
+            wait_time += 0.1
+
+        if not self._listeners_started:
+            log.error("Listeners not started after 10 seconds")
+            return
+
+        mouse_listener = self._mouse_listener
+        key_listener = self._key_listener
+
+        # ---- nested helper inside the async context ----
+        async def flush():
+            if self._pending_event is None:
+                return
+            if self._skip():
+                self._pending_event = None
                 return
 
-            mouse_listener = self._mouse_listener
-            key_listener = self._key_listener
+            ev = self._pending_event
+            # Clear pending event immediately to avoid blocking next event
+            self._pending_event = None
+            event_ts = ev.get("event_ts")
 
-            # ---- nested helper inside the async context ----
-            async def flush():
+            # Update tracked regions before capturing "after" frame
+            await self._update_tracked_regions()
+
+            # Use the region from the event for capturing the "after" frame
+            mon_rect = ev["monitor_rect"]
+            if mon_rect is None:
+                if self.debug:
+                    logging.getLogger("Screen").warning(
+                        "Monitor region not available"
+                    )
+                return
+
+            # Convert screen coordinates to mss coordinates
+            mss_rect = self._screen_to_mss_coords(mon_rect)
+            try:
+                aft = await self._run_in_thread(self._grab_screenshot, mss_rect)
+            except Exception as e:
+                if self.debug:
+                    logging.getLogger("Screen").error(
+                        f"Failed to capture after frame: {e}"
+                    )
+                return
+
+            if "scroll" in ev["type"]:
+                scroll_info = ev.get("scroll", (0, 0))
+                step = f"scroll({ev['position'][0]:.1f}, {ev['position'][1]:.1f}, dx={scroll_info[0]:.2f}, dy={scroll_info[1]:.2f})"
+            else:
+                step = f"{ev['type']}({ev['position'][0]:.1f}, {ev['position'][1]:.1f})"
+
+            bef_path = await self._save_frame(
+                ev["before"],
+                ev["monitor_rect"],
+                ev["position"][0],
+                ev["position"][1],
+                f"{step}_before",
+                event_ts=event_ts,
+            )
+            aft_path = await self._save_frame(
+                aft,
+                mon_rect,
+                ev["position"][0],
+                ev["position"][1],
+                f"{step}_after",
+                event_ts=event_ts,
+            )
+            await self._process_and_emit(
+                bef_path, aft_path, ev["type"], ev, event_ts=event_ts
+            )
+
+            log.info(f"{ev['type']} captured on window {ev['mon']}")
+
+        # ---- mouse event reception ----
+        async def _handle_mouse_event(x: float, y: float, typ: str):
+            try:
+                base, phase = typ.rsplit("_", 1)
+            except ValueError:
+                if self.debug:
+                    log.info(f"Ignoring mouse event '{typ}' without phase suffix")
+                return
+
+            if phase not in {"down", "up"}:
+                return
+
+            if phase == "up":
                 if self._pending_event is None:
                     return
-                if self._skip():
-                    self._pending_event = None
-                    return
 
-                ev = self._pending_event
-                # Clear pending event immediately to avoid blocking next event
-                self._pending_event = None
-                event_ts = ev.get("event_ts")
+                async def delayed_flush():
+                    await asyncio.sleep(self._after_delay)
+                    await flush()
 
-                # Update tracked regions before capturing "after" frame
-                await self._update_tracked_regions()
-
-                # Use the region from the event for capturing the "after" frame
-                mon_rect = ev["monitor_rect"]
-                if mon_rect is None:
-                    if self.debug:
-                        logging.getLogger("Screen").warning(
-                            "Monitor region not available"
-                        )
-                    return
-
-                # Convert screen coordinates to mss coordinates
-                mss_rect = self._screen_to_mss_coords(mon_rect)
-                try:
-                    aft = await self._run_in_thread(sct.grab, mss_rect)
-                except Exception as e:
-                    if self.debug:
-                        logging.getLogger("Screen").error(
-                            f"Failed to capture after frame: {e}"
-                        )
-                    return
-
-                if "scroll" in ev["type"]:
-                    scroll_info = ev.get("scroll", (0, 0))
-                    step = f"scroll({ev['position'][0]:.1f}, {ev['position'][1]:.1f}, dx={scroll_info[0]:.2f}, dy={scroll_info[1]:.2f})"
-                else:
-                    step = f"{ev['type']}({ev['position'][0]:.1f}, {ev['position'][1]:.1f})"
-
-                bef_path = await self._save_frame(
-                    ev["before"],
-                    ev["monitor_rect"],
-                    ev["position"][0],
-                    ev["position"][1],
-                    f"{step}_before",
-                    event_ts=event_ts,
-                )
-                aft_path = await self._save_frame(
-                    aft,
-                    mon_rect,
-                    ev["position"][0],
-                    ev["position"][1],
-                    f"{step}_after",
-                    event_ts=event_ts,
-                )
-                await self._process_and_emit(
-                    bef_path, aft_path, ev["type"], ev, event_ts=event_ts
-                )
-
-                log.info(f"{ev['type']} captured on window {ev['mon']}")
-
-            # ---- mouse event reception ----
-            async def _handle_mouse_event(x: float, y: float, typ: str):
-                try:
-                    base, phase = typ.rsplit("_", 1)
-                except ValueError:
-                    if self.debug:
-                        log.info(f"Ignoring mouse event '{typ}' without phase suffix")
-                    return
-
-                if phase not in {"down", "up"}:
-                    return
-
-                if phase == "up":
-                    if self._pending_event is None:
-                        return
-
-                    async def delayed_flush():
-                        await asyncio.sleep(self._after_delay)
-                        await flush()
-
-                    asyncio.create_task(delayed_flush())
-                    return
-
-                # Convert pynput coordinates to screen coordinates
-                if IS_MACOS:
-                    # On macOS, pynput returns Cocoa coords (Y=0 at bottom), convert to screen coords (Y=0 at top)
-                    _, _, _, gmax_y = await self._run_in_thread(_get_global_bounds)
-                    screen_y = gmax_y - y
-                else:
-                    # On Linux, pynput already returns Y=0 at top, no conversion needed
-                    screen_y = y
-
-                if self.debug:
-                    logging.getLogger("Screen").debug(
-                        "Mouse event raw coords: (%.1f, %.1f)", x, y
-                    )
-
-                # Check if point is in any of our tracked windows/regions
-                tracked = self._find_region_for_point(x, screen_y)
-                # print(tracked)
-                if tracked is None:
-                    if self.debug:
-                        log.info(
-                            f"{typ:<6} @({x:7.1f},{screen_y:7.1f}) outside tracked window(s), skipping"
-                        )
-                    return
-
-                # Update regions for tracked windows
-                if tracked["id"] is not None:
-                    await self._update_tracked_regions()
-
-                mon = tracked["region"]
-
-                idx = self._tracked_windows.index(tracked) + 1  # 1-indexed for display
-
-                # Grab FRESH "before" frame using current window rect
-                # Convert screen coordinates to mss coordinates
-                mss_mon = self._screen_to_mss_coords(mon)
-                try:
-                    bf = await self._run_in_thread(sct.grab, mss_mon)
-                except Exception as e:
-                    if self.debug:
-                        log.error(f"Failed to capture before frame: {e}")
-                    return
-
-                if self._skip():
-                    return
-
-                # Update activity timestamp
-                await self._update_activity_time()
-
-                event_ts = time.time()
-                rel_x = x - mon["left"]
-                if IS_MACOS:
-                    # On macOS, screen_y is from top, so relative Y is from bottom
-                    rel_y = mon["top"] + mon["height"] - screen_y
-                else:
-                    # On Linux, screen_y is already from top, so relative Y is from top
-                    rel_y = screen_y - mon["top"]
-                log.info(
-                    f"{typ:<6} @({rel_x:7.1f},{rel_y:7.1f}) → win={idx}"
-                )
-                self._pending_event = {
-                    "type": base,
-                    "position": (rel_x, rel_y),
-                    "mon": idx,
-                    "before": bf,
-                    "monitor_rect": mon,
-                    "event_ts": event_ts,
-                }
+                asyncio.create_task(delayed_flush())
                 return
 
-            # ---- keyboard event reception ----
-            async def _handle_key_event(key, typ: str):
-                # Get current mouse position to determine active window
-                x, y = mouse.Controller().position
+            # Convert pynput coordinates to screen coordinates
+            if IS_MACOS:
+                # On macOS, pynput returns Cocoa coords (Y=0 at bottom), convert to screen coords (Y=0 at top)
+                _, _, _, gmax_y = await self._run_in_thread(_get_global_bounds)
+                screen_y = gmax_y - y
+            else:
+                # On Linux, pynput already returns Y=0 at top, no conversion needed
+                screen_y = y
 
-                # Convert pynput coordinates to screen coordinates
-                if IS_MACOS:
-                    # On macOS, pynput returns Cocoa coords (Y=0 at bottom), convert to screen coords (Y=0 at top)
-                    _, _, _, gmax_y = await self._run_in_thread(_get_global_bounds)
-                    screen_y = gmax_y - y
-                else:
-                    # On Linux, pynput already returns Y=0 at top, no conversion needed
-                    screen_y = y
-
-                # Check if point is in any of our tracked windows/regions
-                tracked = self._find_region_for_point(x, screen_y)
-                if tracked is None:
-                    if self.debug:
-                        log.info(
-                            f"Key {typ}: {str(key)} outside tracked window(s), skipping"
-                        )
-                    return
-
-                # Update regions for tracked windows
-                if tracked["id"] is not None:
-                    await self._update_tracked_regions()
-
-                mon = tracked["region"]
-                rel_x = x - mon["left"]
-                if IS_MACOS:
-                    rel_y = screen_y - mon["height"]
-                else:
-                    rel_y = screen_y - mon["top"]
-                idx = self._tracked_windows.index(tracked) + 1  # 1-indexed for display
-
-                # Grab FRESH frame using current window rect
-                # Convert screen coordinates to mss coordinates
-                mss_mon = self._screen_to_mss_coords(mon)
-                try:
-                    frame = await self._run_in_thread(sct.grab, mss_mon)
-                except Exception as e:
-                    if self.debug:
-                        log.error(f"Failed to capture keyboard frame: {e}")
-                    return
-
-                log.info(f"Key {typ}: {str(key)} on window {idx}")
-
-                # Update activity timestamp
-                await self._update_activity_time()
-
-                event_ts = time.time()
-                step = f"key_{typ}({str(key)})"
-                await self.update_queue.put(
-                    Update(content=step, content_type="input_text", event_ts=event_ts)
+            if self.debug:
+                logging.getLogger("Screen").debug(
+                    "Mouse event raw coords: (%.1f, %.1f)", x, y
                 )
 
-                async with self._key_activity_lock:
-                    current_time = time.time()
+            # Check if point is in any of our tracked windows/regions
+            tracked = self._find_region_for_point(x, screen_y)
+            # print(tracked)
+            if tracked is None:
+                if self.debug:
+                    log.info(
+                        f"{typ:<6} @({x:7.1f},{screen_y:7.1f}) outside tracked window(s), skipping"
+                    )
+                return
 
-                    # Check if this is the start of a new keyboard session
-                    if (
-                        self._key_activity_start is None
-                        or current_time - self._key_activity_start
-                        > self._key_activity_timeout
-                    ):
-                    # Start new session - save first screenshot
-                        self._key_activity_start = current_time
-                        self._key_screenshots = []
+            # Update regions for tracked windows
+            if tracked["id"] is not None:
+                await self._update_tracked_regions()
 
-                        # Save frame
-                        screenshot_path = await self._save_frame(
-                            frame,
-                            mon,
-                            rel_x,
-                            rel_y,
-                            f"{step}_first",
-                            event_ts=event_ts,
-                        )
-                        self._key_screenshots.append(screenshot_path)
-                        log.info(
-                            f"Started new keyboard session, saved first screenshot: {screenshot_path}"
-                        )
-                    else:
-                        # Continue existing session - save intermediate screenshot
-                        screenshot_path = await self._save_frame(
-                            frame,
-                            mon,
-                            rel_x,
-                            rel_y,
-                            f"{step}_intermediate",
-                            highlight=False,
-                            event_ts=event_ts,
-                        )
-                        self._key_screenshots.append(screenshot_path)
-                        log.info(
-                            f"Continued keyboard session, saved intermediate screenshot: {screenshot_path}"
-                        )
+            mon = tracked["region"]
 
-                    # Schedule cleanup of previous intermediate screenshots
-                    if len(self._key_screenshots) > 2:
-                        asyncio.create_task(self._cleanup_key_screenshots())
+            idx = self._tracked_windows.index(tracked) + 1  # 1-indexed for display
 
-            # ---- scroll event reception ----
-            async def _handle_scroll_event(x: float, y: float, dx: float, dy: float):
-                # Convert pynput coordinates to screen coordinates
-                if IS_MACOS:
-                    # On macOS, pynput returns Cocoa coords (Y=0 at bottom), convert to screen coords (Y=0 at top)
-                    _, _, _, gmax_y = await self._run_in_thread(_get_global_bounds)
-                    screen_y = gmax_y - y
+            # Grab FRESH "before" frame using current window rect
+            # Convert screen coordinates to mss coordinates
+            mss_mon = self._screen_to_mss_coords(mon)
+            try:
+                bf = await self._run_in_thread(self._grab_screenshot, mss_mon)
+            except Exception as e:
+                if self.debug:
+                    log.error(f"Failed to capture before frame: {e}")
+                return
+
+            if self._skip():
+                return
+
+            # Update activity timestamp
+            await self._update_activity_time()
+
+            event_ts = time.time()
+            rel_x = x - mon["left"]
+            if IS_MACOS:
+                # On macOS, screen_y is from top, so relative Y is from bottom
+                rel_y = mon["top"] + mon["height"] - screen_y
+            else:
+                # On Linux, screen_y is already from top, so relative Y is from top
+                rel_y = screen_y - mon["top"]
+            log.info(
+                f"{typ:<6} @({rel_x:7.1f},{rel_y:7.1f}) → win={idx}"
+            )
+            self._pending_event = {
+                "type": base,
+                "position": (rel_x, rel_y),
+                "mon": idx,
+                "before": bf,
+                "monitor_rect": mon,
+                "event_ts": event_ts,
+            }
+            return
+
+        # ---- keyboard event reception ----
+        async def _handle_key_event(key, typ: str):
+            # Get current mouse position to determine active window
+            x, y = mouse.Controller().position
+
+            # Convert pynput coordinates to screen coordinates
+            if IS_MACOS:
+                # On macOS, pynput returns Cocoa coords (Y=0 at bottom), convert to screen coords (Y=0 at top)
+                _, _, _, gmax_y = await self._run_in_thread(_get_global_bounds)
+                screen_y = gmax_y - y
+            else:
+                # On Linux, pynput already returns Y=0 at top, no conversion needed
+                screen_y = y
+
+            # Check if point is in any of our tracked windows/regions
+            tracked = self._find_region_for_point(x, screen_y)
+            if tracked is None:
+                if self.debug:
+                    log.info(
+                        f"Key {typ}: {str(key)} outside tracked window(s), skipping"
+                    )
+                return
+
+            # Update regions for tracked windows
+            if tracked["id"] is not None:
+                await self._update_tracked_regions()
+
+            mon = tracked["region"]
+            rel_x = x - mon["left"]
+            if IS_MACOS:
+                rel_y = screen_y - mon["height"]
+            else:
+                rel_y = screen_y - mon["top"]
+            idx = self._tracked_windows.index(tracked) + 1  # 1-indexed for display
+
+            # Grab FRESH frame using current window rect
+            # Convert screen coordinates to mss coordinates
+            mss_mon = self._screen_to_mss_coords(mon)
+            try:
+                frame = await self._run_in_thread(self._grab_screenshot, mss_mon)
+            except Exception as e:
+                if self.debug:
+                    log.error(f"Failed to capture keyboard frame: {e}")
+                return
+
+            log.info(f"Key {typ}: {str(key)} on window {idx}")
+
+            # Update activity timestamp
+            await self._update_activity_time()
+
+            event_ts = time.time()
+            step = f"key_{typ}({str(key)})"
+            await self.update_queue.put(
+                Update(content=step, content_type="input_text", event_ts=event_ts)
+            )
+
+            async with self._key_activity_lock:
+                current_time = time.time()
+
+                # Check if this is the start of a new keyboard session
+                if (
+                    self._key_activity_start is None
+                    or current_time - self._key_activity_start
+                    > self._key_activity_timeout
+                ):
+                # Start new session - save first screenshot
+                    self._key_activity_start = current_time
+                    self._key_screenshots = []
+
+                    # Save frame
+                    screenshot_path = await self._save_frame(
+                        frame,
+                        mon,
+                        rel_x,
+                        rel_y,
+                        f"{step}_first",
+                        event_ts=event_ts,
+                    )
+                    self._key_screenshots.append(screenshot_path)
+                    log.info(
+                        f"Started new keyboard session, saved first screenshot: {screenshot_path}"
+                    )
                 else:
-                    # On Linux, pynput already returns Y=0 at top, no conversion needed
-                    screen_y = y
+                    # Continue existing session - save intermediate screenshot
+                    screenshot_path = await self._save_frame(
+                        frame,
+                        mon,
+                        rel_x,
+                        rel_y,
+                        f"{step}_intermediate",
+                        highlight=False,
+                        event_ts=event_ts,
+                    )
+                    self._key_screenshots.append(screenshot_path)
+                    log.info(
+                        f"Continued keyboard session, saved intermediate screenshot: {screenshot_path}"
+                    )
 
-                # Apply scroll filtering
-                async with self._scroll_lock:
-                    if not self._should_log_scroll(x, screen_y, dx, dy):
-                        if self.debug:
-                            log.info(f"Scroll filtered out: dx={dx:.2f}, dy={dy:.2f}")
-                        return
+                # Schedule cleanup of previous intermediate screenshots
+                if len(self._key_screenshots) > 2:
+                    asyncio.create_task(self._cleanup_key_screenshots())
 
-                # Check if point is in any of our tracked windows/regions
-                tracked = self._find_region_for_point(x, screen_y)
-                if tracked is None:
+        # ---- scroll event reception ----
+        async def _handle_scroll_event(x: float, y: float, dx: float, dy: float):
+            # Convert pynput coordinates to screen coordinates
+            if IS_MACOS:
+                # On macOS, pynput returns Cocoa coords (Y=0 at bottom), convert to screen coords (Y=0 at top)
+                _, _, _, gmax_y = await self._run_in_thread(_get_global_bounds)
+                screen_y = gmax_y - y
+            else:
+                # On Linux, pynput already returns Y=0 at top, no conversion needed
+                screen_y = y
+
+            # Apply scroll filtering
+            async with self._scroll_lock:
+                if not self._should_log_scroll(x, screen_y, dx, dy):
                     if self.debug:
-                        log.info(
-                            f"Scroll @({x:7.1f},{screen_y:7.1f}) outside tracked window(s), skipping"
-                        )
+                        log.info(f"Scroll filtered out: dx={dx:.2f}, dy={dy:.2f}")
                     return
 
-                # Update regions for tracked windows
-                if tracked["id"] is not None:
-                    await self._update_tracked_regions()
+            # Check if point is in any of our tracked windows/regions
+            tracked = self._find_region_for_point(x, screen_y)
+            if tracked is None:
+                if self.debug:
+                    log.info(
+                        f"Scroll @({x:7.1f},{screen_y:7.1f}) outside tracked window(s), skipping"
+                    )
+                return
 
-                mon = tracked["region"]
-                rel_x = x - mon["left"]
-                if IS_MACOS:
-                    rel_y = screen_y - mon["height"]
-                else:
-                    rel_y = screen_y - mon["top"]
-                idx = self._tracked_windows.index(tracked) + 1  # 1-indexed for display
+            # Update regions for tracked windows
+            if tracked["id"] is not None:
+                await self._update_tracked_regions()
 
-                # Grab FRESH "before" frame using current window rect
-                # Convert screen coordinates to mss coordinates
-                mss_mon = self._screen_to_mss_coords(mon)
-                try:
-                    bf = await self._run_in_thread(sct.grab, mss_mon)
-                except Exception as e:
-                    if self.debug:
-                        log.error(f"Failed to capture before frame: {e}")
-                    return
+            mon = tracked["region"]
+            rel_x = x - mon["left"]
+            if IS_MACOS:
+                rel_y = screen_y - mon["height"]
+            else:
+                rel_y = screen_y - mon["top"]
+            idx = self._tracked_windows.index(tracked) + 1  # 1-indexed for display
 
-                # Only log significant scroll movements
-                scroll_magnitude = (dx**2 + dy**2) ** 0.5
-                if scroll_magnitude < 1.0:  # Very small scrolls
-                    if self.debug:
-                        log.info(f"Scroll too small: magnitude={scroll_magnitude:.2f}")
-                    return
+            # Grab FRESH "before" frame using current window rect
+            # Convert screen coordinates to mss coordinates
+            mss_mon = self._screen_to_mss_coords(mon)
+            try:
+                bf = await self._run_in_thread(self._grab_screenshot, mss_mon)
+            except Exception as e:
+                if self.debug:
+                    log.error(f"Failed to capture before frame: {e}")
+                return
 
-                log.info(
-                    f"Scroll @({rel_x:7.1f},{rel_y:7.1f}) dx={dx:.2f} dy={dy:.2f} → win={idx}"
-                )
+            # Only log significant scroll movements
+            scroll_magnitude = (dx**2 + dy**2) ** 0.5
+            if scroll_magnitude < 1.0:  # Very small scrolls
+                if self.debug:
+                    log.info(f"Scroll too small: magnitude={scroll_magnitude:.2f}")
+                return
 
-                if self._skip():
-                    return
+            log.info(
+                f"Scroll @({rel_x:7.1f},{rel_y:7.1f}) dx={dx:.2f} dy={dy:.2f} → win={idx}"
+            )
 
-                # Update activity timestamp
-                await self._update_activity_time()
+            if self._skip():
+                return
 
-                event_ts = time.time()
-                self._pending_event = {
-                    "type": "scroll",
-                    "position": (rel_x, rel_y),
-                    "mon": idx,
-                    "before": bf,
-                    "scroll": (dx, dy),
-                    "monitor_rect": mon,
-                    "event_ts": event_ts,
-                }
+            # Update activity timestamp
+            await self._update_activity_time()
 
-                # Process event immediately
-                await flush()
+            event_ts = time.time()
+            self._pending_event = {
+                "type": "scroll",
+                "position": (rel_x, rel_y),
+                "mon": idx,
+                "before": bf,
+                "scroll": (dx, dy),
+                "monitor_rect": mon,
+                "event_ts": event_ts,
+            }
 
-            # Connect the handler functions to the instance variables
-            # so the pynput callbacks can invoke them
-            self._mouse_handler = _handle_mouse_event
-            self._scroll_handler = _handle_scroll_event
-            self._key_handler = _handle_key_event
+            # Process event immediately
+            await flush()
 
-            # ---- main capture loop ----
-            log.info(f"Screen observer started — guarding {self._guard or '∅'}")
-            last_periodic = time.time()
-            last_screenshot_cleanup = time.time()
-            frame_count = 0
+        # Connect the handler functions to the instance variables
+        # so the pynput callbacks can invoke them
+        self._mouse_handler = _handle_mouse_event
+        self._scroll_handler = _handle_scroll_event
+        self._key_handler = _handle_key_event
 
-            # Initialize last activity time
+        # ---- main capture loop ----
+        log.info(f"Screen observer started — guarding {self._guard or '∅'}")
+        last_periodic = time.time()
+        last_screenshot_cleanup = time.time()
+        frame_count = 0
+
+        # Initialize last activity time
+        async with self._inactivity_lock:
+            self._last_activity_time = time.time()
+
+        while self._running:  # flag from base class
+            t0 = time.time()
+
+            # Check for inactivity timeout
             async with self._inactivity_lock:
-                self._last_activity_time = time.time()
-
-            while self._running:  # flag from base class
-                t0 = time.time()
-
-                # Check for inactivity timeout
-                async with self._inactivity_lock:
-                    if self._last_activity_time is not None:
-                        inactive_duration = t0 - self._last_activity_time
-                        if inactive_duration >= self._inactivity_timeout:
-                            log.info(
-                                "Stopping recording due to %.1f minutes of inactivity",
-                                inactive_duration / 60,
-                            )
-                            banner = "=" * 70
-                            log.info(banner)
-                            log.info(
-                                "Recording automatically stopped after %.1f minutes of inactivity",
-                                inactive_duration / 60,
-                            )
-                            log.info(banner)
-                            self._running = False
-                            # Stop listeners to exit the main thread
-                            self.stop_listeners_sync()
-                            break
-
-                # For tracked windows, update regions periodically
-                # We capture frames at event time (not periodic)
-                if self._tracked_windows:
-                    any_window_open = await self._update_tracked_regions()
-
-                    # Stop recording if all tracked windows are closed
-                    if not any_window_open:
-                        log.info("All tracked windows closed - stopping recording")
+                if self._last_activity_time is not None:
+                    inactive_duration = t0 - self._last_activity_time
+                    if inactive_duration >= self._inactivity_timeout:
+                        log.info(
+                            "Stopping recording due to %.1f minutes of inactivity",
+                            inactive_duration / 60,
+                        )
                         banner = "=" * 70
                         log.info(banner)
-                        log.info("All tracked windows have been closed")
+                        log.info(
+                            "Recording automatically stopped after %.1f minutes of inactivity",
+                            inactive_duration / 60,
+                        )
                         log.info(banner)
+                        self._running = False
                         # Stop listeners to exit the main thread
                         self.stop_listeners_sync()
-                        self._running = False
                         break
 
-                    if (
-                        self.debug and frame_count % 30 == 0
-                    ):  # Log every 30 frames to avoid spam
-                        log.info(f"Updated tracked window regions")
-                    frame_count += 1
+            # For tracked windows, update regions periodically
+            # We capture frames at event time (not periodic)
+            if self._tracked_windows:
+                any_window_open = await self._update_tracked_regions()
 
-                    # Force garbage collection periodically to prevent memory buildup
-                    if frame_count % self._MEMORY_CLEANUP_INTERVAL == 0:
-                        await self._run_in_thread(gc.collect)
+                # Stop recording if all tracked windows are closed
+                if not any_window_open:
+                    log.info("All tracked windows closed - stopping recording")
+                    banner = "=" * 70
+                    log.info(banner)
+                    log.info("All tracked windows have been closed")
+                    log.info(banner)
+                    # Stop listeners to exit the main thread
+                    self.stop_listeners_sync()
+                    self._running = False
+                    break
 
-                # Clean up old screenshots every 5 minutes
-                if t0 - last_screenshot_cleanup > 300:  # 300 seconds = 5 minutes
-                    await self._cleanup_old_screenshots()
-                    last_screenshot_cleanup = t0
-
-                # Check for keyboard session timeout
-                current_time = time.time()
                 if (
-                    self._key_activity_start is not None
-                    and current_time - self._key_activity_start
-                    > self._key_activity_timeout
-                    and len(self._key_screenshots) > 1
-                ):
-                    # Session ended - rename last screenshot to indicate it's the final one
-                    async with self._key_activity_lock:
-                        if len(self._key_screenshots) > 1:
-                            last_path = self._key_screenshots[-1]
-                            final_path = last_path.replace("_intermediate", "_final")
-                            try:
-                                await self._run_in_thread(
-                                    os.rename, last_path, final_path
-                                )
-                                self._key_screenshots[-1] = final_path
-                                log.info(
-                                    f"Keyboard session ended, renamed final screenshot: {final_path}"
-                                )
-                            except OSError:
-                                pass
-                        self._key_activity_start = None
-                        self._key_screenshots = []
+                    self.debug and frame_count % 30 == 0
+                ):  # Log every 30 frames to avoid spam
+                    log.info(f"Updated tracked window regions")
+                frame_count += 1
 
-                # fps throttle
-                dt = time.time() - t0
-                await asyncio.sleep(max(0, (1 / CAP_FPS) - dt))
+                # Force garbage collection periodically to prevent memory buildup
+                if frame_count % self._MEMORY_CLEANUP_INTERVAL == 0:
+                    await self._run_in_thread(gc.collect)
 
-            # Shutdown listeners if started in async worker
-            # (main thread listeners are stopped via stop_listeners_sync)
-            if not self._start_listeners_on_main_thread:
-                mouse_listener.stop()
-                key_listener.stop()
+            # Clean up old screenshots every 5 minutes
+            if t0 - last_screenshot_cleanup > 300:  # 300 seconds = 5 minutes
+                await self._cleanup_old_screenshots()
+                last_screenshot_cleanup = t0
 
-            # Final cleanup of any remaining keyboard session
-            if self._key_activity_start is not None and len(self._key_screenshots) > 1:
+            # Check for keyboard session timeout
+            current_time = time.time()
+            if (
+                self._key_activity_start is not None
+                and current_time - self._key_activity_start
+                > self._key_activity_timeout
+                and len(self._key_screenshots) > 1
+            ):
+                # Session ended - rename last screenshot to indicate it's the final one
                 async with self._key_activity_lock:
-                    last_path = self._key_screenshots[-1]
-                    final_path = last_path.replace("_intermediate", "_final")
-                    try:
-                        await self._run_in_thread(os.rename, last_path, final_path)
-                        log.info(
-                            f"Final keyboard session cleanup, renamed: {final_path}"
-                        )
-                    except OSError:
-                        pass
-                    await self._cleanup_key_screenshots()
+                    if len(self._key_screenshots) > 1:
+                        last_path = self._key_screenshots[-1]
+                        final_path = last_path.replace("_intermediate", "_final")
+                        try:
+                            await self._run_in_thread(
+                                os.rename, last_path, final_path
+                            )
+                            self._key_screenshots[-1] = final_path
+                            log.info(
+                                f"Keyboard session ended, renamed final screenshot: {final_path}"
+                            )
+                        except OSError:
+                            pass
+                    self._key_activity_start = None
+                    self._key_screenshots = []
+
+            # fps throttle
+            dt = time.time() - t0
+            await asyncio.sleep(max(0, (1 / CAP_FPS) - dt))
+
+        # Shutdown listeners if started in async worker
+        # (main thread listeners are stopped via stop_listeners_sync)
+        if not self._start_listeners_on_main_thread:
+            mouse_listener.stop()
+            key_listener.stop()
+
+        # Final cleanup of any remaining keyboard session
+        if self._key_activity_start is not None and len(self._key_screenshots) > 1:
+            async with self._key_activity_lock:
+                last_path = self._key_screenshots[-1]
+                final_path = last_path.replace("_intermediate", "_final")
+                try:
+                    await self._run_in_thread(os.rename, last_path, final_path)
+                    log.info(
+                        f"Final keyboard session cleanup, renamed: {final_path}"
+                    )
+                except OSError:
+                    pass
+                await self._cleanup_key_screenshots()
