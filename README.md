@@ -56,7 +56,7 @@ swe-prod-recorder [OPTIONS]
 ```
 usage: swe-prod-recorder [-h]
                          [--upload-to-gdrive]
-                         [--record-all-screens]
+                         [--record-all-screens | --all]
                          [--inactivity-timeout INACTIVITY_TIMEOUT]
                          --pr PR
 
@@ -66,7 +66,8 @@ productivity research
 options:
   -h, --help            Show this help message and exit
   --upload-to-gdrive    Upload screenshots to Google Drive and delete local copies
-  --record-all-screens  Record all monitors/screens (no window selection needed)
+  --record-all-screens, --all
+                        Record all monitors/screens (no window selection needed). Default on Linux.
   --inactivity-timeout INACTIVITY_TIMEOUT
                         Stop recording after N minutes of inactivity (default: 45)
   --pr PR               PR number to organize screen recording data under data/pr_{pr} (required; use issue number if PRs are not available yet, or 0 for onboarding)
@@ -84,7 +85,7 @@ When the recorder starts, you'll see an overlay for selecting which windows to r
 **IMPORTANT**: If you are running macOS Tahoe 26.X, please use the following command instead.
 
 ```bash
-swe-prod-recorder --record-all-screens
+swe-prod-recorder --all
 ```
 
 There is a known issue that leads the screen recorder to fail after the window selection in this OS version. This command will record your full screen during interactions, so please make sure to close all personal files prior to recording.
