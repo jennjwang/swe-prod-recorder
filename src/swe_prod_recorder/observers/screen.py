@@ -877,7 +877,7 @@ class Screen(Observer):
         if highlight:
             # Calculate a compact cursor box based on actual frame scale
             avg_scale = (scale_x + scale_y) / 2.0
-            cursor_box_half = max(3, int(6 * avg_scale))  # ~12 logical points overall
+            cursor_box_half = max(3, int(8 * avg_scale))  # ~16 logical points overall
             x1 = max(0, x_pixel - cursor_box_half)
             x2 = min(frame.width, x_pixel + cursor_box_half)
             y1 = max(0, y_pixel - cursor_box_half)
