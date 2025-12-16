@@ -246,135 +246,32 @@ class Screen(Observer):
         if record_all_screens:
             # Record all monitors/screens
             import mss
-            try:
-                with mss.mss() as sct:
-                    monitors = sct.monitors
-                    if self.debug:
-                        log.debug(f"mss detected {len(monitors)} monitor(s) total")
-                    
-                    # Check if we have any monitors (monitor 0 is all monitors combined)
-                    if len(monitors) < 2:
-                        log.warning(f"mss only detected {len(monitors)} monitor(s), expected at least 2 (including combined monitor)")
-                        # Fallback 1: try using monitor 0 (combined monitor) if available
-                        if len(monitors) == 1 and monitors[0]:
-                            monitor = monitors[0]
-                            if IS_MACOS:
-                                _, _, _, gmax_y = _get_global_bounds()
-                                screen_top = gmax_y - monitor["top"] - monitor["height"]
-                            else:
-                                screen_top = monitor["top"]
-                            
-                            region = {
-                                "left": monitor["left"],
-                                "top": int(screen_top),
-                                "width": monitor["width"],
-                                "height": monitor["height"]
-                            }
-                            self._tracked_windows.append({
-                                "id": None,
-                                "region": region,
-                                "original_size": None
-                            })
-                            log.info(f"Using combined monitor (monitor 0) as fallback: {region}")
-                        else:
-                            # Fallback 2: use global bounds
-                            min_x, min_y, max_x, max_y = _get_global_bounds()
-                            region = {
-                                "left": int(min_x),
-                                "top": int(min_y),
-                                "width": int(max_x - min_x),
-                                "height": int(max_y - min_y)
-                            }
-                            self._tracked_windows.append({
-                                "id": None,
-                                "region": region,
-                                "original_size": None
-                            })
-                            log.info(f"Using global bounds as fallback: {region}")
+            with mss.mss() as sct:
+                # Iterate through all monitors (skip monitor 0 which is all monitors combined)
+                for i, monitor in enumerate(sct.monitors[1:], 1):
+                    if IS_MACOS:
+                        # On macOS, mss uses Quartz coords (Y=0 at bottom), need to convert to screen coords (Y=0 at top)
+                        # Reverse of convert_screen_to_quartz_y: screen_y = gmax_y - quartz_y - height
+                        _, _, _, gmax_y = _get_global_bounds()
+                        screen_top = gmax_y - monitor["top"] - monitor["height"]
                     else:
-                        # Check if we have individual monitors (monitors[1:]) or just the combined monitor
-                        individual_monitors = monitors[1:]
-                        if not individual_monitors:
-                            # On Wayland, mss might only return the combined monitor
-                            log.info("Individual monitors not detected, using combined monitor (monitor 0)")
-                            monitor = monitors[0]
-                            if IS_MACOS:
-                                _, _, _, gmax_y = _get_global_bounds()
-                                screen_top = gmax_y - monitor["top"] - monitor["height"]
-                            else:
-                                screen_top = monitor["top"]
-                            
-                            region = {
-                                "left": monitor["left"],
-                                "top": int(screen_top),
-                                "width": monitor["width"],
-                                "height": monitor["height"]
-                            }
-                            self._tracked_windows.append({
-                                "id": None,
-                                "region": region,
-                                "original_size": None
-                            })
-                            log.info(f"Using combined monitor for full screen recording: {region}")
-                        else:
-                            # Iterate through all monitors (skip monitor 0 which is all monitors combined)
-                            for i, monitor in enumerate(individual_monitors, 1):
-                                if self.debug:
-                                    log.debug(f"Monitor {i}: {monitor}")
-                                
-                                if IS_MACOS:
-                                    # On macOS, mss uses Quartz coords (Y=0 at bottom), need to convert to screen coords (Y=0 at top)
-                                    # Reverse of convert_screen_to_quartz_y: screen_y = gmax_y - quartz_y - height
-                                    _, _, _, gmax_y = _get_global_bounds()
-                                    screen_top = gmax_y - monitor["top"] - monitor["height"]
-                                else:
-                                    # On Linux (X11 and Wayland), mss uses standard coords (Y=0 at top), no conversion needed
-                                    screen_top = monitor["top"]
+                        # On Linux, mss already uses standard coords (Y=0 at top), no conversion needed
+                        screen_top = monitor["top"]
 
-                                region = {
-                                    "left": monitor["left"],
-                                    "top": int(screen_top),
-                                    "width": monitor["width"],
-                                    "height": monitor["height"]
-                                }
-                                self._tracked_windows.append({
-                                    "id": None,  # No window tracking for full screen recording
-                                    "region": region,
-                                    "original_size": None  # Fixed region, never update
-                                })
-                                if self.debug:
-                                    log.info(f"Recording full screen - Monitor {i}: {region}")
-            except Exception as e:
-                log.error(f"Failed to detect monitors with mss: {e}")
-                # Fallback: use global bounds to create a single full-screen region
-                try:
-                    min_x, min_y, max_x, max_y = _get_global_bounds()
                     region = {
-                        "left": int(min_x),
-                        "top": int(min_y),
-                        "width": int(max_x - min_x),
-                        "height": int(max_y - min_y)
+                        "left": monitor["left"],
+                        "top": int(screen_top),
+                        "width": monitor["width"],
+                        "height": monitor["height"]
                     }
                     self._tracked_windows.append({
-                        "id": None,
+                        "id": None,  # No window tracking for full screen recording
                         "region": region,
-                        "original_size": None
+                        "original_size": None  # Fixed region, never update
                     })
-                    log.warning(f"Using fallback full screen region due to mss error: {region}")
-                except Exception as fallback_error:
-                    log.error(f"Fallback to global bounds also failed: {fallback_error}")
-                    raise RuntimeError(
-                        "Failed to detect screen regions. "
-                        "On Wayland, ensure screen capture permissions are granted. "
-                        "Try: xdg-desktop-portal or check compositor permissions."
-                    ) from e
+                    if self.debug:
+                        log.info(f"Recording full screen - Monitor {i}: {region}")
 
-            if not self._tracked_windows:
-                raise RuntimeError(
-                    "No monitors detected for full screen recording. "
-                    "On Wayland, ensure screen capture permissions are granted."
-                )
-            
             log.info(f"Recording all {len(self._tracked_windows)} monitor(s)")
         elif track_window_id:
             # Track window by ID
