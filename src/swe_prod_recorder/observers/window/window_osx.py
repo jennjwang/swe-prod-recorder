@@ -1,7 +1,10 @@
+import logging
 import objc
 import AppKit
 import Quartz
 from Foundation import NSDate, NSRunLoop
+
+log = logging.getLogger(__name__)
 
 _selected_regions = []  # List of selected regions
 _selected_window_ids = []  # List of selected window IDs
@@ -140,7 +143,7 @@ class SelectionView(AppKit.NSView):
         # Ctrl+C = cancel
         is_ctrl_c = keyCode == 8 and (modifiers & AppKit.NSEventModifierFlagControl)
         if is_ctrl_c:
-            print("Ctrl+C pressed - cancelling")
+            log.info("Ctrl+C pressed - cancelling")
             _selected_regions = []
             _selected_window_ids = []
             _selection_cancelled = True
@@ -150,7 +153,7 @@ class SelectionView(AppKit.NSView):
         # Enter or Return = confirm selection
         elif keyCode == 36 or keyCode == 76:  # kVK_Return or kVK_KeypadEnter
             if self.selected_windows:
-                print(f"ENTER pressed - confirming selection of {len(self.selected_windows)} window(s)")
+                log.info(f"ENTER pressed - confirming selection of {len(self.selected_windows)} window(s)")
                 _selected_regions = [w.copy() for w in self.selected_windows]
                 _selected_window_ids = [
                     w.get("window_id") for w in self.selected_windows
@@ -161,7 +164,7 @@ class SelectionView(AppKit.NSView):
                 _selection_confirmed = True
                 self._close_all_overlays()
             else:
-                print("No windows selected. Please click windows to select them first.")
+                log.warning("No windows selected. Please click windows to select them first.")
             return
 
         objc.super(SelectionView, self).keyDown_(event)
@@ -194,7 +197,7 @@ class SelectionView(AppKit.NSView):
             ):
                 # Clicked DONE button
                 if self.selected_windows:
-                    print(
+                    log.debug(
                         f"DONE button clicked - confirming {len(self.selected_windows)} window(s)"
                     )
                     _selected_regions = [w.copy() for w in self.selected_windows]
@@ -212,7 +215,7 @@ class SelectionView(AppKit.NSView):
         # Double-click on empty area to confirm selection (backup method)
         if event.clickCount() == 2 and window_info is None and not self.start:
             if self.selected_windows:
-                print(
+                log.debug(
                     f"Double-click detected - confirming selection of {len(self.selected_windows)} window(s)"
                 )
                 _selected_regions = [w.copy() for w in self.selected_windows]
@@ -232,7 +235,7 @@ class SelectionView(AppKit.NSView):
             for i, w in enumerate(_shared_selected_windows):
                 if w.get("window_id") == window_id:
                     _shared_selected_windows.pop(i)
-                    print(
+                    log.debug(
                         f"Removed window from selection (total: {len(_shared_selected_windows)})"
                     )
                     already_selected = True
@@ -241,10 +244,10 @@ class SelectionView(AppKit.NSView):
             if not already_selected and window_id:
                 # Add window to selection
                 _shared_selected_windows.append(window_info.copy())
-                print(
+                log.debug(
                     f"Added window to selection (total: {len(_shared_selected_windows)})"
                 )
-                print(f"  Window bounds: left={window_info['left']}, top={window_info['top']}, "
+                log.debug(f"  Window bounds: left={window_info['left']}, top={window_info['top']}, "
                       f"width={window_info['width']}, height={window_info['height']}")
 
             self.highlighted_window = None
@@ -276,7 +279,7 @@ class SelectionView(AppKit.NSView):
 
         # Skip if no actual drag occurred (width or height is 0)
         if width == 0 or height == 0:
-            print(f"No region drawn (width={width}, height={height}), ignoring.")
+            log.debug(f"No region drawn (width={width}, height={height}), ignoring.")
             self.start = None
             self.end = None
             self.setNeedsDisplay_(True)
@@ -299,7 +302,7 @@ class SelectionView(AppKit.NSView):
             "height": int(height),
         }
         _shared_selected_windows.append(manual_region)
-        print(f"Added manual region to selection: {width}x{height} (total: {len(_shared_selected_windows)})")
+        log.info(f"Added manual region to selection: {width}x{height} (total: {len(_shared_selected_windows)})")
 
         # Reset drag state
         self.start = None
@@ -696,14 +699,14 @@ def select_region_with_mouse() -> tuple[list[dict], list[int | None]]:
 
         if keyCode == 36 or keyCode == 76:  # kVK_Return or kVK_KeypadEnter
             if _shared_selected_windows:
-                print(f"ENTER pressed - confirming selection of {len(_shared_selected_windows)} window(s)")
+                log.debug(f"ENTER pressed - confirming selection of {len(_shared_selected_windows)} window(s)")
                 _selected_regions = [w.copy() for w in _shared_selected_windows]
                 _selected_window_ids = [w.get("window_id") for w in _shared_selected_windows]
                 for region in _selected_regions:
                     region.pop("window_id", None)
                 _selection_confirmed = True
             else:
-                print("No windows selected. Please click windows to select them first.")
+                log.warning("No windows selected. Please click windows to select them first.")
         return event
 
     # Install global keyboard monitor
@@ -756,12 +759,12 @@ def select_region_with_mouse() -> tuple[list[dict], list[int | None]]:
             NSDate.dateWithTimeIntervalSinceNow_(0.05)
         )
 
-    # Debug: print selected regions
-    print(f"Selected regions count: {len(_selected_regions)}")
+    # Log selected regions
+    log.info(f"Selected regions count: {len(_selected_regions)}")
 
     # Check if user cancelled
     if _selection_cancelled or not _selection_confirmed:
         raise RuntimeError("Selection cancelled")
 
-    print(f"Returning {len(_selected_regions)} selected region(s)")
+    log.info(f"Returning {len(_selected_regions)} selected region(s)")
     return _selected_regions, _selected_window_ids
