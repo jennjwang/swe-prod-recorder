@@ -1,38 +1,16 @@
-"""Linux-specific screen geometry helpers using X11 and mss APIs.
+"""Linux-specific screen geometry helpers using X11 and mss APIs."""
 
-Supports both X11 and Wayland:
-- X11: Uses wmctrl and xwininfo for window management
-- Wayland: Uses graceful fallbacks (window management features limited)
-- Both: mss works for screen capture on both X11 and Wayland
-"""
-
-import os
 from typing import List, Optional, Tuple
 
 import mss
 
 
-def _is_wayland() -> bool:
-    """Detect if running on Wayland display server.
-    
-    Returns
-    -------
-    bool
-        True if running on Wayland, False if X11 or unknown
-    """
-    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
-    wayland_display = os.environ.get("WAYLAND_DISPLAY")
-    return session_type == "wayland" or wayland_display is not None
-
-
 def get_global_bounds() -> Tuple[float, float, float, float]:
     """Return a bounding box enclosing **all** physical displays.
 
-    Works on both X11 and Wayland using mss (which supports both).
-
     Returns
     -------
-    (min_x, min_y, max_x, max_y) tuple in screen coordinates (Y=0 at top).
+    (min_x, min_y, max_x, max_y) tuple in X11 coordinates (Y=0 at top).
     """
     with mss.mss() as sct:
         min_x = min_y = float("inf")
@@ -69,12 +47,9 @@ def window_exists(window_id: int) -> bool:
     bool
         True if window exists (open, minimized, or on different Space), False if closed
     """
-    # On Wayland, window management APIs are not available
-    # Assume window exists (conservative approach to prevent premature stopping)
-    if _is_wayland():
-        return True
-    
-    # On X11, try to query window via xwininfo
+    # On Linux, try to query window via X11
+    # For now, assume window exists if we can't verify (conservative approach)
+    # This prevents premature stopping of recording
     try:
         from ..window.pyxsys.xwininfo import read_xwin_tree
         x_tree = read_xwin_tree()
@@ -94,11 +69,7 @@ def get_window_bounds_by_id(window_id: int) -> Optional[Tuple[dict, str]]:
         (Bounds dict, owner name) if window is visible, (None, None) otherwise.
         Bounds: {'left': x, 'top': y, 'width': w, 'height': h} in screen coordinates (Y=0 at top)
     """
-    # On Wayland, window management APIs are not available
-    if _is_wayland():
-        return None, None
-    
-    # On X11, query window via wmctrl and xwininfo
+    # On Linux, query window via X11
     try:
         from ..window.pyxsys.xwininfo import read_xwin_tree
         from ..window.pyxsys.wmctrl import read_wmctrl_listings
@@ -128,15 +99,11 @@ def get_topmost_window_at_point(x: float, y: float) -> Optional[Tuple[int, str]]
     """Get the window ID and owner of the topmost window at the given point.
 
     Parameters:
-    - x, y: Mouse coordinates from pynput (screen coordinates, Y=0 at top)
+    - x, y: Mouse coordinates from pynput (X11 coordinates, Y=0 at top)
 
     Returns tuple of (window_id, owner_name) or (None, None) if none found.
     """
-    # On Wayland, window management APIs are not available
-    if _is_wayland():
-        return None, None
-    
-    # On X11, query windows via wmctrl and xwininfo
+    # On Linux, query windows via X11
     try:
         from ..window.pyxsys.xwininfo import read_xwin_tree
         from ..window.pyxsys.wmctrl import read_wmctrl_listings
@@ -165,11 +132,7 @@ def get_topmost_window_at_point(x: float, y: float) -> Optional[Tuple[int, str]]
 
 def is_app_visible(names) -> bool:
     """Return *True* if **any** window from *names* is at least partially visible."""
-    # On Wayland, window management APIs are not available
-    if _is_wayland():
-        return False
-    
-    # On X11, check via wmctrl
+    # On Linux, check via X11 window manager
     try:
         from ..window.pyxsys.wmctrl import read_wmctrl_listings
         targets = set(names)
