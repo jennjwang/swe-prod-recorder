@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import platform
 import signal
 import sys
 import threading
@@ -39,8 +40,10 @@ def parse_args():
     )
     parser.add_argument(
         "--record-all-screens",
+        "--all",
+        dest="record_all_screens",
         action="store_true",
-        help="Record all monitors/screens (no window selection needed)",
+        help="Record all monitors/screens (no window selection needed). Default on Linux.",
     )
     parser.add_argument(
         "--inactivity-timeout",
@@ -94,6 +97,10 @@ def main():
     APIs) runs on the main thread, avoiding dispatch queue assertion failures.
     """
     args = parse_args()
+
+    # Default to --all on Linux
+    if platform.system() == "Linux" and not args.record_all_screens:
+        args.record_all_screens = True
 
     if args.upload_to_gdrive:
         try:

@@ -1,6 +1,8 @@
 # src/swe_prod_recorder/observers/window/window_linux.py
 
+import logging
 import sys
+from typing import Optional
 
 from PyQt5.QtCore import QRect, Qt
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen
@@ -8,6 +10,8 @@ from PyQt5.QtWidgets import QApplication, QWidget
 
 from .pyxsys.wmctrl import read_wmctrl_listings
 from .pyxsys.xwininfo import read_xwin_tree
+
+log = logging.getLogger(__name__)
 
 
 class WindowSelectionOverlay(QWidget):
@@ -22,9 +26,9 @@ class WindowSelectionOverlay(QWidget):
         self.wm_territory.xref_x_session(self.x_tree)
 
         self.windows = self._get_selectable_windows()
-        print(f"Found {len(self.windows)} selectable windows:")
-        for w in self.windows[:5]:  # Print first 5
-            print(
+        log.info(f"Found {len(self.windows)} selectable windows:")
+        for w in self.windows[:5]:  # Log first 5
+            log.debug(
                 f"  {w['title']}: x={w['left']}, y={w['top']}, w={w['width']}, h={w['height']}"
             )
 
@@ -34,13 +38,14 @@ class WindowSelectionOverlay(QWidget):
         self.setWindowState(Qt.WindowFullScreen)
         self.setMouseTracking(True)
 
-    def _get_selectable_windows(self):
+    def _get_selectable_windows(self) -> list[dict]:
+        """Get list of selectable windows with their geometry."""
         windows = []
 
-        print(f"WM territory has {len(self.wm_territory.windows)} windows")
+        log.debug(f"WM territory has {len(self.wm_territory.windows)} windows")
 
         for wm_win in self.wm_territory.windows:
-            print(
+            log.debug(
                 f"WM window: {wm_win.title}, x_win_id={getattr(wm_win, 'x_win_id', 'NOT SET')}"
             )
 
@@ -48,10 +53,10 @@ class WindowSelectionOverlay(QWidget):
                 continue
 
             x_win = self.x_tree.select_id(wm_win.x_win_id)
-            print(f"  Found x_win: {x_win is not None}")
+            log.debug(f"  Found x_win: {x_win is not None}")
 
             if x_win:
-                print(f"  Has geom: {x_win.geom is not None}")
+                log.debug(f"  Has geom: {x_win.geom is not None}")
                 if x_win.geom:
                     windows.append(
                         {
@@ -73,15 +78,15 @@ class WindowSelectionOverlay(QWidget):
         for win in self.windows:
             rect = QRect(win["left"], win["top"], win["width"], win["height"])
             if rect.contains(pos):
-                print(f"Hovering over: {win['title']}")
+                log.debug(f"Hovering over: {win['title']}")
                 self.highlighted_window = win
                 break
 
         self.update()
 
     def mousePressEvent(self, event):
-        print(f"DEBUG: Click at {event.pos()}")
-        print(f"DEBUG: Highlighted: {self.highlighted_window}")
+        log.debug(f"Click at {event.pos()}")
+        log.debug(f"Highlighted: {self.highlighted_window}")
         if event.button() == Qt.LeftButton:
             if self.highlighted_window:
                 # Handle window selection
@@ -90,12 +95,12 @@ class WindowSelectionOverlay(QWidget):
                 for i, w in enumerate(self.selected_windows):
                     if w["id"] == win_id:
                         self.selected_windows.pop(i)
-                        print(f"✗ Deselected (total: {len(self.selected_windows)})")
+                        log.info(f"✗ Deselected (total: {len(self.selected_windows)})")
                         self.update()
                         return
 
                 self.selected_windows.append(self.highlighted_window.copy())
-                print(f"✓ Selected (total: {len(self.selected_windows)})")
+                log.info(f"✓ Selected (total: {len(self.selected_windows)})")
                 self.update()
             # If no window highlighted, click passes through automatically
 
@@ -105,7 +110,7 @@ class WindowSelectionOverlay(QWidget):
             self.close()
         elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
             if self.selected_windows:
-                print(f"✓ Confirmed {len(self.selected_windows)} window(s)")
+                log.info(f"✓ Confirmed {len(self.selected_windows)} window(s)")
                 self.close()
 
     def paintEvent(self, event):
@@ -143,7 +148,16 @@ class WindowSelectionOverlay(QWidget):
         painter.drawText(20, 35, "Click windows to select • ESC=cancel • ENTER=confirm")
 
 
-def select_region_with_mouse():
+def select_region_with_mouse() -> tuple[list[dict], list[Optional[int]]]:
+    """Modal overlay for selecting multiple windows.
+
+    Returns
+    -------
+    tuple[list[dict], list[Optional[int]]]
+        A tuple of (list of region_dicts, list of window_ids). For windows that were selected,
+        window_id will be the X11 window ID for tracking. For manual rectangles, window_id will be None.
+        Regions are returned in X11 coordinates (Y=0 at top).
+    """
     app = QApplication.instance() or QApplication(sys.argv)
 
     overlay = WindowSelectionOverlay()
@@ -167,4 +181,5 @@ def select_region_with_mouse():
         )
         window_ids.append(win["id"])
 
+    log.info(f"Returning {len(regions)} selected region(s)")
     return regions, window_ids
