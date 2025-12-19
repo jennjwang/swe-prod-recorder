@@ -1,6 +1,6 @@
 # SWE Productivity Recorder
 
-A macOS screen activity recorder built on top of [gum](https://github.com/GeneralUserModels/gum) (Linux version coming soon!). It guides a participant through selecting the windows they are comfortable sharing and records high-signal screen activity around user interactions.
+A macOS + Linux screen activity recorder built on top of [gum](https://github.com/GeneralUserModels/gum). It guides a participant through selecting the windows they are comfortable sharing and records high-signal screen activity around user interactions.
 
 The project pairs a command-line facilitator (`cli.py`) with an asynchronous observer framework (`gum.py`) and a `Screen` observer that captures before/after screenshots, keyboard sessions, and mouse events.
 
@@ -15,8 +15,8 @@ The project pairs a command-line facilitator (`cli.py`) with an asynchronous obs
 
 ## Requirements
 
-- macOS 12 or later
-- System permissions:
+- macOS 12 or later, or Linux (X11). On Linux the recorder defaults to capturing all monitors (`--all`).
+- macOS system permissions:
   - Screen Recording permission for your terminal
   - Accessibility permission for keyboard/mouse monitoring
   - Grant these in: System Settings → Privacy & Security
@@ -58,6 +58,7 @@ usage: swe-prod-recorder [-h]
                          [--upload-to-gdrive]
                          [--record-all-screens]
                          [--inactivity-timeout INACTIVITY_TIMEOUT]
+                         [--debug]
                          --pr PR
 
 SWE Productivity Recorder - Screen activity recorder for software engineer
@@ -69,12 +70,15 @@ options:
   --record-all-screens  Record all monitors/screens (no window selection needed)
   --inactivity-timeout INACTIVITY_TIMEOUT
                         Stop recording after N minutes of inactivity (default: 45)
+  --debug, -d           Enable debug logging
   --pr PR               PR number to organize screen recording data under data/pr_{pr} (required; use issue number if PRs are not available yet, or 0 for onboarding)
 ```
 
 ### Window Selection
 
-When the recorder starts, you'll see an overlay for selecting which windows to record:
+On macOS you'll see an overlay for selecting which windows to record. Linux runs in full-screen mode by default (equivalent to `--all`), so the picker is skipped there.
+
+If you're using the overlay:
 
 1. **Click on windows** to select them (they turn GREEN)
 2. **Click selected windows again** to deselect them
@@ -150,7 +154,7 @@ When using `--upload-to-gdrive`, screenshots are uploaded directly to Google Dri
 ```
 recorder/
 ├── config/
-│   ├── .env.example          # Template for Google OAuth credentials
+│   ├── .env                  # Your Google OAuth credentials (not committed)
 │   └── .google_auth/         # Auto-generated (gitignored)
 │       ├── client_secrets.json
 │       └── credentials.json
