@@ -27,7 +27,9 @@ The project pairs a command-line facilitator (`cli.py`) with an asynchronous obs
 
 ### Installation
 
-Install into a conda environment **(recommended)**:
+Install into a virtual environment.
+
+We recommend using conda -- you can follow the [installation instructions to set it up](https://docs.conda.io/projects/conda/en/stable/user-guide/install/index.html#regular-installation).
 
 ```bash
 conda create -n recorder python=3.11
