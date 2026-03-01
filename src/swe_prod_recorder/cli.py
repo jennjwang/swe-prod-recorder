@@ -10,18 +10,18 @@ import threading
 # pynput's MouseListener tries to lazily import AXIsProcessTrusted in a background thread,
 # which fails due to pyobjc's lazy import not being thread-safe. We pre-load it here on the
 # main thread before any listeners start.
-try:
-    from ApplicationServices import AXIsProcessTrusted as _AXIsProcessTrusted
-    from pynput._util import darwin
+if platform.system() == "Darwin":
+    try:
+        from ApplicationServices import AXIsProcessTrusted as _AXIsProcessTrusted
+        from pynput._util import darwin
 
-    # Force the lazy load now on main thread
-    if hasattr(darwin, 'HIServices') and hasattr(darwin.HIServices, 'AXIsProcessTrusted'):
-        _ = darwin.HIServices.AXIsProcessTrusted()
-    elif hasattr(darwin, 'HIServices'):
-        darwin.HIServices.AXIsProcessTrusted = _AXIsProcessTrusted
-
-except Exception as e:
-    print(f"Warning: Could not pre-load AXIsProcessTrusted: {e}")
+        # Force the lazy load now on main thread
+        if hasattr(darwin, 'HIServices') and hasattr(darwin.HIServices, 'AXIsProcessTrusted'):
+            _ = darwin.HIServices.AXIsProcessTrusted()
+        elif hasattr(darwin, 'HIServices'):
+            darwin.HIServices.AXIsProcessTrusted = _AXIsProcessTrusted
+    except Exception as e:
+        print(f"Warning: Could not pre-load AXIsProcessTrusted: {e}")
 
 from .gum import gum
 from .observers import Screen
@@ -79,10 +79,14 @@ async def _async_main(screen_observer, stop_event, data_directory):
         async with gum(user_name, screen_observer, data_directory=data_directory):
             # Wait for stop signal
             while not stop_event.is_set():
+                if not screen_observer._running:
+                    stop_event.set()
+                    break
                 await asyncio.sleep(0.1)
     except Exception as e:
         print(f"Error in async loop: {e}")
         import traceback
+
         traceback.print_exc()
 
 
@@ -98,9 +102,24 @@ def main():
     """
     args = parse_args()
 
+    current_platform = platform.system()
+    is_macos = current_platform == "Darwin"
+    is_linux = current_platform == "Linux"
+
     # Default to --all on Linux
-    if platform.system() == "Linux" and not args.record_all_screens:
+    if is_linux and not args.record_all_screens:
         args.record_all_screens = True
+
+    is_wayland = is_linux and (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+    if is_wayland:
+        print(
+            "\n⚠️  Wayland detected: global keyboard/mouse hooks may not work reliably."
+        )
+        print("   Running standard event logic with Wayland-safe frame fallback.")
 
     if args.upload_to_gdrive:
         try:
@@ -126,9 +145,13 @@ def main():
             else:
                 print(f"❌ Could not generate client_secrets.json")
                 print("\nPlease either:")
-                print("  1. Create a .env file with GOOGLE_CLIENT_ID, GOOGLE_PROJECT_ID, and GOOGLE_CLIENT_SECRET")
+                print(
+                    "  1. Create a .env file with GOOGLE_CLIENT_ID, GOOGLE_PROJECT_ID, and GOOGLE_CLIENT_SECRET"
+                )
                 print("     (See config/.env.example for template)")
-                print("  2. Or place client_secrets.json manually in config/.google_auth/ directory")
+                print(
+                    "  2. Or place client_secrets.json manually in config/.google_auth/ directory"
+                )
                 sys.exit(1)
 
         # Authenticate with Google Drive (will use cached credentials if available)
@@ -179,7 +202,7 @@ def main():
         record_all_screens=args.record_all_screens,
         inactivity_timeout=args.inactivity_timeout * 60,
         debug=args.debug,
-        start_listeners_on_main_thread=True,  # macOS-safe mode
+        start_listeners_on_main_thread=is_macos,
         screenshots_dir=screenshots_dir,
     )
 
@@ -188,14 +211,17 @@ def main():
 
     # Launch asyncio event loop in background thread
     async_thread = threading.Thread(
-        target=lambda: asyncio.run(_async_main(screen_observer, stop_event, data_directory)),
+        target=lambda: asyncio.run(
+            _async_main(screen_observer, stop_event, data_directory)
+        ),
         daemon=True,
-        name="AsyncIOThread"
+        name="AsyncIOThread",
     )
     async_thread.start()
 
     # Give async loop time to initialize
     import time
+
     time.sleep(0.5)
 
     # Set up Ctrl+C handler
@@ -208,11 +234,17 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        # Run pynput listeners on main thread (blocks until stopped)
-        screen_observer.run_listeners_on_main_thread()
+        if is_macos:
+            # macOS: keep keyboard listener on main thread to satisfy TIS requirements
+            screen_observer.run_listeners_on_main_thread()
+        else:
+            # Linux: listeners run in observer worker thread
+            while async_thread.is_alive() and not stop_event.is_set():
+                time.sleep(0.1)
 
         # Clean shutdown
         stop_event.set()
+        screen_observer.stop_listeners_sync()
         async_thread.join(timeout=5)
 
     except KeyboardInterrupt:
@@ -222,6 +254,7 @@ def main():
     except Exception as e:
         print(f"Error: {e}")
         import traceback
+
         traceback.print_exc()
         stop_event.set()
         screen_observer.stop_listeners_sync()
