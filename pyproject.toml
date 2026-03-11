@@ -22,6 +22,7 @@ dependencies = [
   "pillow",
   "mss",
   "pynput",
+  "evdev; sys_platform == 'linux'",
   "shapely",
   # macOS-specific dependencies
   "pyobjc-core; sys_platform == 'darwin'",

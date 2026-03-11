@@ -68,7 +68,7 @@ def parse_args():
     return parser.parse_args()
 
 
-async def _async_main(screen_observer, stop_event, data_directory):
+async def _async_main(screen_observer, stop_event, data_directory, checkpoint_db_on_exit=False):
     """Run async event loop in background thread.
 
     This manages the database, observer workers, and update processing.
@@ -76,7 +76,12 @@ async def _async_main(screen_observer, stop_event, data_directory):
     user_name = "anonymous"  # Default user name
 
     try:
-        async with gum(user_name, screen_observer, data_directory=data_directory):
+        async with gum(
+            user_name,
+            screen_observer,
+            data_directory=data_directory,
+            checkpoint_db_on_exit=checkpoint_db_on_exit,
+        ):
             # Wait for stop signal
             while not stop_event.is_set():
                 if not screen_observer._running:
@@ -106,6 +111,11 @@ def main():
     is_macos = current_platform == "Darwin"
     is_linux = current_platform == "Linux"
 
+    if is_linux and os.geteuid() == 0:
+        print("Run `swe-prod-recorder` as your user, not with full sudo.")
+        print("On Wayland, the recorder will request sudo only for /dev/input if needed.")
+        sys.exit(1)
+
     # Default to --all on Linux
     if is_linux and not args.record_all_screens:
         args.record_all_screens = True
@@ -119,7 +129,16 @@ def main():
         print(
             "\n⚠️  Wayland detected: global keyboard/mouse hooks may not work reliably."
         )
-        print("   Running standard event logic with Wayland-safe frame fallback.")
+        print(
+            "   Linux input capture in this build uses pynput's X11 (_xorg) backend via XWayland."
+        )
+        print(
+            "   Native Wayland windows may not emit global input events; XWayland apps can still work."
+        )
+        if os.geteuid() != 0:
+            print(
+                "   The recorder may request sudo for /dev/input access if native Wayland typing is unavailable."
+            )
 
     if args.upload_to_gdrive:
         try:
@@ -163,6 +182,20 @@ def main():
             print(f"❌ Google Drive authentication failed: {exc}")
             sys.exit(1)
 
+    # Set data directory based on PR number
+    data_directory = f"data/pr_{args.pr}"
+    screenshots_dir = f"{data_directory}/screenshots"
+
+    # Create screen observer before confirmation so Wayland sudo preflight can happen first
+    screen_observer = Screen(
+        upload_to_gdrive=args.upload_to_gdrive,
+        record_all_screens=args.record_all_screens,
+        inactivity_timeout=args.inactivity_timeout * 60,
+        debug=args.debug,
+        start_listeners_on_main_thread=is_macos,
+        screenshots_dir=screenshots_dir,
+    )
+
     # Display user warning and instructions
     print("\n" + "=" * 70)
     print("⚠️  BEFORE YOU BEGIN RECORDING")
@@ -188,23 +221,26 @@ def main():
     print("don't want to share.")
     print("\n" + "=" * 70)
 
-    input("\nPress Enter to confirm and start recording...")
+    if is_wayland and screen_observer.needs_wayland_keyboard_helper():
+        print("\nWayland keyboard capture needs temporary sudo access to /dev/input.")
+        print("Authenticating now so typing capture is ready before recording starts...")
+        try:
+            preflight_ok = screen_observer.preflight_wayland_keyboard_helper()
+        except KeyboardInterrupt:
+            print("\n\nShutting down...")
+            sys.exit(130)
+        if not preflight_ok:
+            print(
+                "Sudo authentication was not completed. Native Wayland typing may not be captured."
+            )
+
+    try:
+        input("\nPress Enter to confirm and start recording...")
+    except KeyboardInterrupt:
+        print("\n\nShutting down...")
+        sys.exit(130)
     # print("\nStarting recording...\n")
-
-    # Set data directory based on PR number
-    data_directory = f"data/pr_{args.pr}"
-    screenshots_dir = f"{data_directory}/screenshots"
     print(f"\n📁 Data will be saved to: {data_directory}/")
-
-    # Create screen observer (window selection happens on main thread)
-    screen_observer = Screen(
-        upload_to_gdrive=args.upload_to_gdrive,
-        record_all_screens=args.record_all_screens,
-        inactivity_timeout=args.inactivity_timeout * 60,
-        debug=args.debug,
-        start_listeners_on_main_thread=is_macos,
-        screenshots_dir=screenshots_dir,
-    )
 
     # Coordination between main and background threads
     stop_event = threading.Event()
@@ -212,7 +248,12 @@ def main():
     # Launch asyncio event loop in background thread
     async_thread = threading.Thread(
         target=lambda: asyncio.run(
-            _async_main(screen_observer, stop_event, data_directory)
+            _async_main(
+                screen_observer,
+                stop_event,
+                data_directory,
+                checkpoint_db_on_exit=is_wayland,
+            )
         ),
         daemon=True,
         name="AsyncIOThread",
@@ -229,7 +270,6 @@ def main():
         print("\n\nShutting down...")
         stop_event.set()
         screen_observer.stop_listeners_sync()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -246,11 +286,12 @@ def main():
         stop_event.set()
         screen_observer.stop_listeners_sync()
         async_thread.join(timeout=5)
-
     except KeyboardInterrupt:
         print("\n\nShutting down...")
         stop_event.set()
         screen_observer.stop_listeners_sync()
+        if is_wayland:
+            async_thread.join(timeout=5)
     except Exception as e:
         print(f"Error: {e}")
         import traceback
@@ -258,3 +299,7 @@ def main():
         traceback.print_exc()
         stop_event.set()
         screen_observer.stop_listeners_sync()
+
+
+if __name__ == "__main__":
+    main()

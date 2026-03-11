@@ -393,16 +393,21 @@ class Screen(Observer):
         self._key_handler = None
         self._mouse_listener = None
         self._key_listener = None
+        self._wayland_native_key_handler = None
+        self._wayland_native_key_stop = threading.Event()
+        self._wayland_native_key_threads: list[threading.Thread] = []
+        self._wayland_native_keyboard_enabled = False
+        self._wayland_native_key_helper_proc = None
+        self._wayland_native_key_helper_thread = None
+        self._wayland_keyboard_helper_preflight_attempted = False
+        self._wayland_keyboard_helper_preflight_succeeded = False
         self._start_listeners_on_main_thread = start_listeners_on_main_thread
         self._listeners_started = False
         self._session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
         self._is_wayland = IS_LINUX and (
             self._session_type == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
         )
-        self._periodic_fallback_enabled = IS_LINUX and (
-            self._is_wayland
-            and os.environ.get("SWE_RECORDER_WAYLAND_HEARTBEAT", "0") == "1"
-        )
+        self._periodic_fallback_enabled = False
 
         # Define listener callbacks that safely schedule events to async loop
         def safe_schedule_event(x: float, y: float, typ: str):
@@ -423,6 +428,12 @@ class Screen(Observer):
                     self._key_handler(key, typ), self._loop
                 )
 
+        def safe_schedule_wayland_native_key(key_name: str):
+            if self._loop and self._wayland_native_key_handler:
+                asyncio.run_coroutine_threadsafe(
+                    self._wayland_native_key_handler(key_name), self._loop
+                )
+
         # Store listener factory functions for deferred initialization
         self._mouse_listener_factory = lambda: mouse.Listener(
             on_click=lambda x, y, btn, prs: safe_schedule_event(
@@ -433,6 +444,7 @@ class Screen(Observer):
         self._key_listener_factory = lambda: keyboard.Listener(
             on_press=lambda key: safe_schedule_key(key, "press"),
         )
+        self._safe_schedule_wayland_native_key = safe_schedule_wayland_native_key
 
         # Adjust settings for high-DPI displays
         if self._is_high_dpi:
@@ -989,6 +1001,264 @@ class Screen(Observer):
             )
         )
 
+    async def _capture_initial_state(self, event_ts: float) -> None:
+        await self._update_tracked_regions()
+        tracked_targets = [
+            target for target in self._tracked_windows if target.get("region") is not None
+        ]
+        captured_count = 0
+
+        for idx, tracked in enumerate(tracked_targets, start=1):
+            mon = tracked["region"]
+            mss_mon = self._screen_to_mss_coords(mon)
+            try:
+                frame = await self._run_in_thread(self._grab_screenshot, mss_mon)
+            except Exception as exc:
+                if self.debug:
+                    logging.getLogger("Screen").warning(
+                        "Initial screenshot capture failed for window %s: %s",
+                        idx,
+                        exc,
+                    )
+                frame = self._placeholder_frame(mon, "initial_capture_failed")
+
+            rel_x = mon["width"] / 2
+            rel_y = mon["height"] / 2
+            await self._save_frame(
+                frame,
+                mon,
+                rel_x,
+                rel_y,
+                f"system_start_win{idx}",
+                highlight=False,
+                event_ts=event_ts,
+            )
+            captured_count += 1
+
+        status = f"captured({captured_count}/{len(tracked_targets)})"
+        await self.update_queue.put(
+            Update(
+                content=f"system_session_start(status={status})",
+                content_type="input_text",
+                event_ts=event_ts,
+            )
+        )
+
+    async def _capture_wayland_key_event(
+        self,
+        key_name: str,
+        event_ts: float | None = None,
+    ) -> None:
+        if not self._running:
+            return
+        await self._update_tracked_regions()
+        tracked_targets = [
+            target for target in self._tracked_windows if target.get("region") is not None
+        ]
+        if not tracked_targets:
+            return
+
+        await self._update_activity_time()
+        actual_event_ts = event_ts if event_ts is not None else time.time()
+        step = f"key_press({key_name})"
+        await self.update_queue.put(
+            Update(content=step, content_type="input_text", event_ts=actual_event_ts)
+        )
+
+        for idx, tracked in enumerate(tracked_targets, start=1):
+            mon = tracked["region"]
+            mss_mon = self._screen_to_mss_coords(mon)
+            try:
+                frame = await self._run_in_thread(self._grab_screenshot, mss_mon)
+            except Exception as exc:
+                if self.debug:
+                    logging.getLogger("Screen").warning(
+                        "Wayland key screenshot failed for window %s: %s",
+                        idx,
+                        exc,
+                    )
+                frame = self._placeholder_frame(mon, "wayland_key_capture_failed")
+
+            rel_x = mon["width"] / 2
+            rel_y = mon["height"] / 2
+            await self._save_frame(
+                frame,
+                mon,
+                rel_x,
+                rel_y,
+                f"{step}_win{idx}",
+                highlight=False,
+                event_ts=actual_event_ts,
+            )
+
+    def _normalize_evdev_keycode(self, keycode) -> str | None:
+        if isinstance(keycode, list):
+            keycode = keycode[0]
+        if not isinstance(keycode, str) or not keycode.startswith("KEY_"):
+            return None
+        return keycode[4:].lower()
+
+    def _get_wayland_evdev_keyboard_paths(self) -> list[str]:
+        if not self._is_wayland:
+            return []
+
+        try:
+            from evdev import InputDevice, ecodes, list_devices
+        except ImportError:
+            return []
+
+        keyboard_paths: list[str] = []
+        for path in list_devices():
+            device = None
+            try:
+                device = InputDevice(path)
+                keys = set(device.capabilities().get(ecodes.EV_KEY, []))
+                if ecodes.KEY_A in keys and ecodes.BTN_LEFT not in keys:
+                    keyboard_paths.append(path)
+            except OSError:
+                continue
+            finally:
+                if device is not None:
+                    device.close()
+        return keyboard_paths
+
+    def _run_wayland_evdev_keyboard_loop(self, path: str) -> None:
+        try:
+            from evdev import InputDevice, categorize, ecodes
+        except ImportError:
+            return
+
+        log = logging.getLogger("Screen")
+        try:
+            device = InputDevice(path)
+        except OSError as exc:
+            if self.debug:
+                log.warning("Failed to open Wayland keyboard device %s: %s", path, exc)
+            return
+
+        try:
+            for event in device.read_loop():
+                if self._wayland_native_key_stop.is_set():
+                    break
+                if event.type != ecodes.EV_KEY or event.value != 1:
+                    continue
+                key_name = self._normalize_evdev_keycode(categorize(event).keycode)
+                if key_name is not None:
+                    self._safe_schedule_wayland_native_key(key_name)
+        except OSError as exc:
+            if self.debug and not self._wayland_native_key_stop.is_set():
+                log.warning("Wayland keyboard device loop stopped for %s: %s", path, exc)
+        finally:
+            device.close()
+
+    def _start_wayland_native_keyboard_listener(self) -> bool:
+        keyboard_paths = self._get_wayland_evdev_keyboard_paths()
+        if not keyboard_paths:
+            return False
+
+        self._wayland_native_key_stop.clear()
+        self._wayland_native_key_threads = []
+        for path in keyboard_paths:
+            thread = threading.Thread(
+                target=self._run_wayland_evdev_keyboard_loop,
+                args=(path,),
+                daemon=True,
+                name=f"WaylandKeyboard:{os.path.basename(path)}",
+            )
+            thread.start()
+            self._wayland_native_key_threads.append(thread)
+        self._wayland_native_keyboard_enabled = True
+        return True
+
+    def needs_wayland_keyboard_helper(self) -> bool:
+        return (
+            self._is_wayland
+            and os.geteuid() != 0
+            and not self._get_wayland_evdev_keyboard_paths()
+        )
+
+    def preflight_wayland_keyboard_helper(self) -> bool:
+        if not self.needs_wayland_keyboard_helper():
+            return True
+
+        self._wayland_keyboard_helper_preflight_attempted = True
+        try:
+            result = subprocess.run(["sudo", "-v"], check=False)
+        except OSError:
+            self._wayland_keyboard_helper_preflight_succeeded = False
+            return False
+
+        self._wayland_keyboard_helper_preflight_succeeded = result.returncode == 0
+        return self._wayland_keyboard_helper_preflight_succeeded
+
+    def _handle_wayland_native_key_helper_line(self, line: str) -> None:
+        if not line:
+            return
+
+        prefix, _, payload = line.partition("\t")
+        log = logging.getLogger("Screen")
+        if prefix == "READY":
+            self._wayland_native_keyboard_enabled = True
+            if self.debug:
+                log.warning(
+                    "Wayland native keyboard helper ready for devices: %s",
+                    payload or "unknown",
+                )
+            return
+
+        if prefix == "ERROR":
+            log.warning("Wayland native keyboard helper: %s", payload or "unknown")
+            return
+
+        if prefix == "KEY" and payload:
+            self._safe_schedule_wayland_native_key(payload)
+
+    def _run_wayland_native_key_helper_output(self) -> None:
+        proc = self._wayland_native_key_helper_proc
+        if proc is None or proc.stdout is None:
+            return
+
+        for raw_line in proc.stdout:
+            self._handle_wayland_native_key_helper_line(raw_line.strip())
+
+    def _start_wayland_native_keyboard_helper(self) -> bool:
+        if not self._is_wayland or os.geteuid() == 0:
+            return False
+        if self._wayland_native_key_helper_proc is not None:
+            return True
+        if (
+            self._wayland_keyboard_helper_preflight_attempted
+            and not self._wayland_keyboard_helper_preflight_succeeded
+        ):
+            return False
+
+        helper_path = str(get_package_file("swe_prod_recorder").joinpath("wayland_input_helper.py"))
+        try:
+            proc = subprocess.Popen(
+                ["sudo", sys.executable, helper_path],
+                stdout=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError:
+            return False
+
+        self._wayland_native_key_helper_proc = proc
+        helper_thread = threading.Thread(
+            target=self._run_wayland_native_key_helper_output,
+            daemon=True,
+            name="WaylandKeyboardHelper",
+        )
+        helper_thread.start()
+        self._wayland_native_key_helper_thread = helper_thread
+        return True
+
+    def _cancel_pending_shutdown_state(self) -> None:
+        if self._debounce_handle is not None:
+            self._debounce_handle.cancel()
+            self._debounce_handle = None
+        self._pending_event = None
+
     # ─────────────────────────────── I/O helpers
     def _initialize_gdrive_client(self) -> None:
         """Set up the Google Drive client and ensure the target folder exists."""
@@ -1291,6 +1561,17 @@ class Screen(Observer):
 
     def stop_listeners_sync(self):
         """Stop pynput listeners synchronously (safe to call from signal handler)"""
+        self._running = False
+        self._wayland_native_key_stop.set()
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._cancel_pending_shutdown_state)
+        else:
+            self._cancel_pending_shutdown_state()
+        if self._wayland_native_key_helper_proc is not None:
+            try:
+                self._wayland_native_key_helper_proc.terminate()
+            except OSError:
+                pass
         if self._mouse_listener:
             try:
                 self._mouse_listener.stop()
@@ -1351,6 +1632,16 @@ class Screen(Observer):
                     self._mouse_listener = self._mouse_listener_factory()
                     self._key_listener = self._key_listener_factory()
 
+                    if self._is_wayland:
+                        mouse_backend = type(self._mouse_listener).__module__
+                        key_backend = type(self._key_listener).__module__
+                        log.warning(
+                            "Wayland session detected; pynput listeners are using %s and %s. "
+                            "This captures X11/XWayland input, not native Wayland compositor events.",
+                            mouse_backend,
+                            key_backend,
+                        )
+
                     # Brief delay to let AppKit modal state settle after window selection
                     await asyncio.sleep(0.1)
 
@@ -1387,6 +1678,8 @@ class Screen(Observer):
 
         # ---- nested helper inside the async context ----
         async def flush():
+            if not self._running:
+                return
             if self._pending_event is None:
                 return
             if self._skip():
@@ -1452,6 +1745,8 @@ class Screen(Observer):
 
         # ---- mouse event reception ----
         async def _handle_mouse_event(x: float, y: float, typ: str):
+            if not self._running:
+                return
             try:
                 base, phase = typ.rsplit("_", 1)
             except ValueError:
@@ -1545,6 +1840,10 @@ class Screen(Observer):
 
         # ---- keyboard event reception ----
         async def _handle_key_event(key, typ: str):
+            if not self._running:
+                return
+            if self._wayland_native_keyboard_enabled:
+                return
             # Get current mouse position to determine active window
             x, y = mouse.Controller().position
 
@@ -1650,6 +1949,8 @@ class Screen(Observer):
 
         # ---- scroll event reception ----
         async def _handle_scroll_event(x: float, y: float, dx: float, dy: float):
+            if not self._running:
+                return
             # Convert pynput coordinates to screen coordinates
             if IS_MACOS:
                 # On macOS, pynput returns Cocoa coords (Y=0 at bottom), convert to screen coords (Y=0 at top)
@@ -1736,6 +2037,25 @@ class Screen(Observer):
         self._mouse_handler = _handle_mouse_event
         self._scroll_handler = _handle_scroll_event
         self._key_handler = _handle_key_event
+        self._wayland_native_key_handler = self._capture_wayland_key_event
+
+        if self._is_wayland:
+            native_keyboard_started = self._start_wayland_native_keyboard_listener()
+            self._wayland_native_keyboard_enabled = native_keyboard_started
+            if native_keyboard_started:
+                log.warning(
+                    "Wayland native keyboard capture enabled via /dev/input event devices"
+                )
+            else:
+                helper_started = self._start_wayland_native_keyboard_helper()
+                if helper_started:
+                    log.warning(
+                        "Wayland native keyboard capture requested via sudo helper"
+                    )
+                else:
+                    log.warning(
+                        "Wayland native keyboard capture unavailable; rerun with sudo to access /dev/input/event*"
+                    )
 
         # ---- main capture loop ----
         log.info(f"Screen observer started — guarding {self._guard or '∅'}")
@@ -1748,6 +2068,9 @@ class Screen(Observer):
         # Initialize last activity time
         async with self._inactivity_lock:
             self._last_activity_time = time.time()
+
+        if self._is_wayland:
+            await self._capture_initial_state(time.time())
 
         while self._running:  # flag from base class
             t0 = time.time()
