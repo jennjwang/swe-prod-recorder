@@ -15,11 +15,15 @@ The project pairs a command-line facilitator (`cli.py`) with an asynchronous obs
 
 ## Requirements
 
-- macOS 12 or later, or Linux (X11). On Linux the recorder defaults to capturing all monitors (`--all`).
+- macOS 12 or later, or Linux (X11/Wayland). On Linux the recorder defaults to capturing all monitors (`--all`).
 - macOS system permissions:
   - Screen Recording permission for your terminal
   - Accessibility permission for keyboard/mouse monitoring
   - Grant these in: System Settings → Privacy & Security
+- Linux Wayland requirements:
+  - A working `xdg-desktop-portal` ScreenCast backend
+  - PipeWire and GStreamer (`pipewiresrc`) available on the host
+  - The recorder may prompt for temporary `sudo` access to `/dev/input` so global keyboard/mouse events can be observed
 - Python 3.11 (3.10+ should work, but 3.11 is what the type hints target).
 - Homebrew-installed `sqlite`/`libsqlite3` is recommended for the bundled FTS5 support.
 - Python packages (installed automatically via pip)
@@ -81,7 +85,7 @@ options:
 
 ### Window Selection
 
-On macOS you'll see an overlay for selecting which windows to record. Linux runs in full-screen mode by default (equivalent to `--all`), so the picker is skipped there.
+On macOS you'll see an overlay for selecting which windows to record. Linux runs in full-screen mode by default (equivalent to `--all`), so the picker is skipped there. On Wayland, the recorder uses a persistent portal screencast session and only supports full-screen capture in this mode.
 
 If you're using the overlay:
 

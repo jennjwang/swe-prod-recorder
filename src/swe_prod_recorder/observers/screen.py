@@ -33,12 +33,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import gc
+import glob
+import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from importlib.resources import files as get_package_file
 from typing import Any, Dict, Iterable, List, Optional
@@ -46,7 +53,14 @@ from typing import Any, Dict, Iterable, List, Optional
 import mss
 from PIL import Image, ImageDraw
 
-from pynput import keyboard, mouse  # still synchronous
+try:
+    from pynput import keyboard, mouse  # still synchronous
+
+    PYNPUT_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - platform/session specific
+    keyboard = None
+    mouse = None
+    PYNPUT_IMPORT_ERROR = exc
 
 from ..schemas import Update
 from .observer import Observer
@@ -82,6 +96,7 @@ elif IS_LINUX:
         convert_quartz_region_to_screen,
         convert_screen_to_quartz_y,
         get_global_bounds as _get_global_bounds,
+        get_monitor_regions as _get_monitor_regions,
         get_topmost_window_at_point as _get_topmost_window_at_point,
         get_visible_windows as _get_visible_windows,
         get_window_bounds_by_id as _get_window_bounds_by_id,
@@ -90,6 +105,14 @@ elif IS_LINUX:
     )
 else:
     raise NotImplementedError(f"Platform {sys.platform} not supported")
+
+
+@dataclass
+class _RawFrame:
+    width: int
+    height: int
+    rgb: bytes
+    sequence: int | None = None
 
 ###############################################################################
 # Screen observer                                                             #
@@ -195,6 +218,15 @@ class Screen(Observer):
             # Google Drive initialization will be done lazily on first upload
             # to allow credential caching and avoid repeated auth prompts
 
+        self._session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        self._is_wayland = IS_LINUX and (
+            self._session_type == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
+        if not self._is_wayland and PYNPUT_IMPORT_ERROR is not None:
+            raise RuntimeError(f"pynput is required for this session: {PYNPUT_IMPORT_ERROR}")
+        if self._is_wayland and not record_all_screens:
+            raise RuntimeError("Wayland currently supports --record-all-screens only.")
+
         # Custom thread pool to prevent exhaustion
         self._thread_pool = ThreadPoolExecutor(max_workers=self._MAX_WORKERS)
 
@@ -245,32 +277,44 @@ class Screen(Observer):
         # Set target region from coordinates, window tracking, or mouse selection
         if record_all_screens:
             # Record all monitors/screens
-            import mss
-            with mss.mss() as sct:
-                # Iterate through all monitors (skip monitor 0 which is all monitors combined)
-                for i, monitor in enumerate(sct.monitors[1:], 1):
-                    if IS_MACOS:
+            if IS_LINUX:
+                monitors = _get_monitor_regions()
+                for i, region in enumerate(monitors, 1):
+                    self._tracked_windows.append(
+                        {
+                            "id": None,
+                            "region": region,
+                            "original_size": None,
+                        }
+                    )
+                    if self.debug:
+                        log.info(f"Recording full screen - Monitor {i}: {region}")
+            else:
+                import mss
+
+                with mss.mss() as sct:
+                    # Iterate through all monitors (skip monitor 0 which is all monitors combined)
+                    for i, monitor in enumerate(sct.monitors[1:], 1):
                         # On macOS, mss uses Quartz coords (Y=0 at bottom), need to convert to screen coords (Y=0 at top)
                         # Reverse of convert_screen_to_quartz_y: screen_y = gmax_y - quartz_y - height
                         _, _, _, gmax_y = _get_global_bounds()
                         screen_top = gmax_y - monitor["top"] - monitor["height"]
-                    else:
-                        # On Linux, mss already uses standard coords (Y=0 at top), no conversion needed
-                        screen_top = monitor["top"]
 
-                    region = {
-                        "left": monitor["left"],
-                        "top": int(screen_top),
-                        "width": monitor["width"],
-                        "height": monitor["height"]
-                    }
-                    self._tracked_windows.append({
-                        "id": None,  # No window tracking for full screen recording
-                        "region": region,
-                        "original_size": None  # Fixed region, never update
-                    })
-                    if self.debug:
-                        log.info(f"Recording full screen - Monitor {i}: {region}")
+                        region = {
+                            "left": monitor["left"],
+                            "top": int(screen_top),
+                            "width": monitor["width"],
+                            "height": monitor["height"],
+                        }
+                        self._tracked_windows.append(
+                            {
+                                "id": None,
+                                "region": region,
+                                "original_size": None,
+                            }
+                        )
+                        if self.debug:
+                            log.info(f"Recording full screen - Monitor {i}: {region}")
 
             log.info(f"Recording all {len(self._tracked_windows)} monitor(s)")
         elif track_window_id:
@@ -361,8 +405,28 @@ class Screen(Observer):
         self._mouse_handler = None
         self._scroll_handler = None
         self._key_handler = None
+        self._wayland_key_handler = None
+        self._wayland_mouse_handler = None
+        self._wayland_scroll_handler = None
         self._mouse_listener = None
         self._key_listener = None
+        self._qt_app = None
+        self._wayland_capture_root = (
+            tempfile.mkdtemp(prefix="swe-wayland-capture-") if self._is_wayland else None
+        )
+        self._wayland_capture_helper_proc = None
+        self._wayland_capture_helper_thread = None
+        self._wayland_capture_error: str | None = None
+        self._wayland_capture_ready = False
+        self._wayland_capture_streams: list[dict] = []
+        self._wayland_pointer_position: tuple[float, float] | None = None
+        self._wayland_pointer_lock = threading.Lock()
+        self._wayland_input_helper_proc = None
+        self._wayland_input_helper_thread = None
+        self._wayland_input_helper_error: str | None = None
+        self._wayland_input_ready = False
+        self._wayland_keyboard_helper_preflight_attempted = False
+        self._wayland_keyboard_helper_preflight_succeeded = False
         self._start_listeners_on_main_thread = start_listeners_on_main_thread
         self._listeners_started = False
 
@@ -379,14 +443,42 @@ class Screen(Observer):
             if self._loop and self._key_handler:
                 asyncio.run_coroutine_threadsafe(self._key_handler(key, typ), self._loop)
 
+        def safe_schedule_wayland_key(key_name: str):
+            if self._loop and self._wayland_key_handler:
+                asyncio.run_coroutine_threadsafe(
+                    self._wayland_key_handler(key_name),
+                    self._loop,
+                )
+
+        def safe_schedule_wayland_mouse(button_name: str, phase: str):
+            if self._loop and self._wayland_mouse_handler:
+                asyncio.run_coroutine_threadsafe(
+                    self._wayland_mouse_handler(button_name, phase),
+                    self._loop,
+                )
+
+        def safe_schedule_wayland_scroll(dx: float, dy: float):
+            if self._loop and self._wayland_scroll_handler:
+                asyncio.run_coroutine_threadsafe(
+                    self._wayland_scroll_handler(dx, dy),
+                    self._loop,
+                )
+
         # Store listener factory functions for deferred initialization
         self._mouse_listener_factory = lambda: mouse.Listener(
-            on_click=lambda x, y, btn, prs: safe_schedule_event(x, y, f"click_{btn.name}_{'down' if prs else 'up'}"),
+            on_click=lambda x, y, btn, prs: safe_schedule_event(
+                x,
+                y,
+                f"click_{btn.name}_{'down' if prs else 'up'}",
+            ),
             on_scroll=lambda x, y, dx, dy: safe_schedule_scroll(x, y, dx, dy),
         )
         self._key_listener_factory = lambda: keyboard.Listener(
             on_press=lambda key: safe_schedule_key(key, "press"),
         )
+        self._safe_schedule_wayland_key = safe_schedule_wayland_key
+        self._safe_schedule_wayland_mouse = safe_schedule_wayland_mouse
+        self._safe_schedule_wayland_scroll = safe_schedule_wayland_scroll
 
         # Adjust settings for high-DPI displays
         if self._is_high_dpi:
@@ -623,17 +715,267 @@ class Screen(Observer):
             self._thread_pool, lambda: func(*args, **kwargs)
         )
 
-    def _grab_screenshot(self, mss_rect: dict):
+    def _ensure_qt_application(self):
+        from PyQt5.QtWidgets import QApplication
+
+        if self._qt_app is None:
+            self._qt_app = QApplication.instance()
+            if self._qt_app is None:
+                self._qt_app = QApplication(sys.argv[:1])
+                self._qt_app.setQuitOnLastWindowClosed(False)
+        return self._qt_app
+
+    def _set_wayland_pointer_position(self, x: float, y: float) -> None:
+        with self._wayland_pointer_lock:
+            self._wayland_pointer_position = (float(x), float(y))
+
+    def poll_wayland_cursor_position(self) -> None:
+        if not self._is_wayland:
+            return
+
+        try:
+            from PyQt5.QtGui import QCursor
+
+            self._ensure_qt_application()
+            pos = QCursor.pos()
+            self._set_wayland_pointer_position(pos.x(), pos.y())
+        except Exception as exc:
+            if self.debug:
+                logging.getLogger("Screen").debug(
+                    "Failed to poll Wayland cursor position: %s",
+                    exc,
+                )
+
+    def _get_wayland_pointer_position(self) -> tuple[float, float]:
+        with self._wayland_pointer_lock:
+            pointer = self._wayland_pointer_position
+
+        if pointer is not None:
+            return pointer
+
+        if self._tracked_windows:
+            first_region = self._tracked_windows[0].get("region")
+            if first_region is not None:
+                return (
+                    float(first_region["left"] + first_region["width"] / 2),
+                    float(first_region["top"] + first_region["height"] / 2),
+                )
+
+        return 0.0, 0.0
+
+    def _get_pointer_position(self) -> tuple[float, float]:
+        if self._is_wayland:
+            return self._get_wayland_pointer_position()
+
+        if mouse is None:
+            raise RuntimeError("Pointer position is unavailable without pynput")
+        x, y = mouse.Controller().position
+        return float(x), float(y)
+
+    def _refresh_wayland_ready_state(self) -> None:
+        if not self._is_wayland:
+            return
+        self._listeners_started = self._wayland_capture_ready and self._wayland_input_ready
+
+    def _start_wayland_capture_helper(self) -> None:
+        helper_path = get_package_file("swe_prod_recorder").joinpath(
+            "wayland_capture_helper.py"
+        )
+        command = [
+            "/usr/bin/python3",
+            os.fspath(helper_path),
+            "--output-dir",
+            self._wayland_capture_root,
+            "--fps",
+            str(max(8, self._CAPTURE_FPS * 2)),
+        ]
+
+        try:
+            self._wayland_capture_helper_proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            self._wayland_capture_error = str(exc)
+            return
+
+        self._wayland_capture_helper_thread = threading.Thread(
+            target=self._read_wayland_capture_helper_output,
+            daemon=True,
+            name="WaylandCaptureHelper",
+        )
+        self._wayland_capture_helper_thread.start()
+
+    def _read_wayland_capture_helper_output(self) -> None:
+        proc = self._wayland_capture_helper_proc
+        if proc is None or proc.stdout is None:
+            return
+
+        try:
+            for line in proc.stdout:
+                self._handle_wayland_capture_helper_line(line.rstrip())
+        finally:
+            return_code = proc.wait()
+            if return_code != 0 and self._wayland_capture_error is None:
+                self._wayland_capture_error = (
+                    f"Wayland capture helper exited with status {return_code}"
+                )
+
+    def _configure_wayland_capture_streams(self, streams: list[dict]) -> None:
+        normalized_streams = []
+        for stream in streams:
+            region = stream["region"]
+            normalized_streams.append(
+                {
+                    "node_id": int(stream["node_id"]),
+                    "dir": stream["dir"],
+                    "region": {
+                        "left": int(region["left"]),
+                        "top": int(region["top"]),
+                        "width": int(region["width"]),
+                        "height": int(region["height"]),
+                    },
+                }
+            )
+
+        normalized_streams.sort(
+            key=lambda stream: (stream["region"]["left"], stream["region"]["top"])
+        )
+        self._wayland_capture_streams = normalized_streams
+        self._tracked_windows = [
+            {
+                "id": None,
+                "region": stream["region"],
+                "original_size": None,
+            }
+            for stream in normalized_streams
+        ]
+
+    def _handle_wayland_capture_helper_line(self, line: str) -> None:
+        if not line:
+            return
+
+        kind, _, payload = line.partition("\t")
+        if kind == "READY":
+            try:
+                metadata = json.loads(payload)
+                self._configure_wayland_capture_streams(metadata.get("streams", []))
+                self._wayland_capture_ready = True
+                self._refresh_wayland_ready_state()
+            except Exception as exc:
+                self._wayland_capture_error = f"invalid capture helper payload: {exc}"
+            return
+
+        if kind == "ERROR":
+            self._wayland_capture_error = payload or line
+
+    @staticmethod
+    def _capture_region_overlap(a: dict, b: dict) -> int:
+        left = max(a["left"], b["left"])
+        top = max(a["top"], b["top"])
+        right = min(a["left"] + a["width"], b["left"] + b["width"])
+        bottom = min(a["top"] + a["height"], b["top"] + b["height"])
+        if right <= left or bottom <= top:
+            return 0
+        return (right - left) * (bottom - top)
+
+    def _get_wayland_stream_for_rect(self, mss_rect: dict) -> dict:
+        if not self._wayland_capture_streams:
+            raise RuntimeError("Wayland capture helper is not ready")
+
+        request_region = {
+            "left": int(mss_rect["left"]),
+            "top": int(mss_rect["top"]),
+            "width": int(mss_rect["width"]),
+            "height": int(mss_rect["height"]),
+        }
+        best_stream = None
+        best_overlap = -1
+        for stream in self._wayland_capture_streams:
+            overlap = self._capture_region_overlap(request_region, stream["region"])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_stream = stream
+
+        if best_stream is None:
+            raise RuntimeError(f"No Wayland capture stream matches region: {request_region}")
+        return best_stream
+
+    def _load_wayland_snapshot_from_meta(self, meta: dict) -> _RawFrame:
+        with Image.open(meta["path"]) as image:
+            image.load()
+            rgb = image.convert("RGB")
+            return _RawFrame(
+                width=rgb.width,
+                height=rgb.height,
+                rgb=rgb.tobytes(),
+                sequence=int(meta["sequence"]),
+            )
+
+    def _read_wayland_stream_snapshot(
+        self,
+        stream: dict,
+        *,
+        min_sequence: int | None = None,
+        wait_timeout: float = 0.0,
+    ) -> _RawFrame:
+        latest_path = os.path.join(stream["dir"], "latest.json")
+        deadline = time.time() + max(0.0, wait_timeout)
+        latest_candidate = None
+
+        while True:
+            if os.path.exists(latest_path):
+                try:
+                    with open(latest_path, encoding="utf-8") as handle:
+                        meta = json.load(handle)
+                    if os.path.exists(meta["path"]):
+                        latest_candidate = meta
+                        sequence = int(meta["sequence"])
+                        if min_sequence is None or sequence > min_sequence:
+                            return self._load_wayland_snapshot_from_meta(meta)
+                except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                    pass
+
+            if time.time() >= deadline:
+                if latest_candidate is not None:
+                    return self._load_wayland_snapshot_from_meta(latest_candidate)
+                raise RuntimeError(
+                    f"Wayland stream has no captured frame yet: {stream['dir']}"
+                )
+
+            time.sleep(0.05)
+
+    def _grab_screenshot(
+        self,
+        mss_rect: dict,
+        min_sequence: int | None = None,
+        wait_timeout: float = 0.0,
+    ):
         """Thread-safe screenshot capture using mss.
         
         Creates a new mss instance per thread to avoid thread-local storage issues.
         """
+        if self._is_wayland:
+            stream = self._get_wayland_stream_for_rect(mss_rect)
+            return self._read_wayland_stream_snapshot(
+                stream,
+                min_sequence=min_sequence,
+                wait_timeout=wait_timeout,
+            )
         with mss.mss() as sct:
             return sct.grab(mss_rect)
 
     def _detect_high_dpi(self) -> bool:
         """Detect if running on a high-DPI display and adjust settings."""
         try:
+            if self._is_wayland:
+                return any(
+                    monitor["width"] > 2560 or monitor["height"] > 1600
+                    for monitor in _get_monitor_regions()
+                )
             # Check if any monitor has high resolution (likely Retina)
             with mss.mss() as sct:
                 for monitor in sct.monitors[1:]:  # Skip monitor 0 (all monitors)
@@ -708,6 +1050,166 @@ class Screen(Observer):
         """
         # Pruning disabled - keep all screenshots
         return
+
+    def _get_wayland_evdev_device_paths(self, *, keyboard_device: bool) -> list[str]:
+        if not self._is_wayland:
+            return []
+
+        try:
+            from evdev import InputDevice, ecodes, list_devices
+        except Exception:
+            return []
+
+        candidate_paths = list(list_devices())
+        if not keyboard_device:
+            candidate_paths.extend(glob.glob("/dev/input/by-path/*event-mouse"))
+
+        seen_paths: set[str] = set()
+        paths: list[str] = []
+        for path in candidate_paths:
+            device = None
+            try:
+                real_path = os.path.realpath(path)
+                if real_path in seen_paths:
+                    continue
+                seen_paths.add(real_path)
+
+                device = InputDevice(real_path)
+                capabilities = device.capabilities(absinfo=False)
+                keys = set(capabilities.get(ecodes.EV_KEY, []))
+                rels = set(capabilities.get(ecodes.EV_REL, []))
+                abss = set(capabilities.get(ecodes.EV_ABS, []))
+                is_keyboard = ecodes.KEY_A in keys and ecodes.BTN_LEFT not in keys
+                is_pointer = (
+                    ecodes.BTN_LEFT in keys
+                    or ecodes.BTN_RIGHT in keys
+                    or ecodes.BTN_MIDDLE in keys
+                    or ecodes.BTN_SIDE in keys
+                    or ecodes.REL_X in rels
+                    or ecodes.REL_Y in rels
+                    or ecodes.REL_WHEEL in rels
+                    or ecodes.REL_HWHEEL in rels
+                    or ecodes.ABS_X in abss
+                    or ecodes.ABS_Y in abss
+                )
+                if keyboard_device and is_keyboard:
+                    paths.append(real_path)
+                if not keyboard_device and is_pointer:
+                    paths.append(real_path)
+            except Exception:
+                continue
+            finally:
+                if device is not None:
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+        return paths
+
+    def _get_wayland_evdev_keyboard_paths(self) -> list[str]:
+        return self._get_wayland_evdev_device_paths(keyboard_device=True)
+
+    def _get_wayland_evdev_mouse_paths(self) -> list[str]:
+        return self._get_wayland_evdev_device_paths(keyboard_device=False)
+
+    def _wayland_input_helper_requires_sudo(self) -> bool:
+        device_paths = (
+            self._get_wayland_evdev_keyboard_paths()
+            + self._get_wayland_evdev_mouse_paths()
+        )
+        if not device_paths:
+            return True
+        return not all(os.access(path, os.R_OK) for path in device_paths)
+
+    def needs_wayland_input_helper(self) -> bool:
+        return self._is_wayland
+
+    def preflight_wayland_input_helper(self) -> bool:
+        self._wayland_keyboard_helper_preflight_attempted = True
+        if not self.needs_wayland_input_helper():
+            return False
+        if os.geteuid() == 0 or not self._wayland_input_helper_requires_sudo():
+            self._wayland_keyboard_helper_preflight_succeeded = True
+            return True
+
+        result = subprocess.run(["sudo", "-v"], check=False)
+        self._wayland_keyboard_helper_preflight_succeeded = result.returncode == 0
+        return self._wayland_keyboard_helper_preflight_succeeded
+
+    def _start_wayland_input_helper(self) -> None:
+        helper_path = get_package_file("swe_prod_recorder").joinpath(
+            "wayland_input_helper.py"
+        )
+        command = [sys.executable, os.fspath(helper_path)]
+
+        if os.geteuid() != 0 and self._wayland_input_helper_requires_sudo():
+            if not self._wayland_keyboard_helper_preflight_succeeded:
+                self._wayland_input_helper_error = (
+                    "Wayland input helper needs sudo access to /dev/input."
+                )
+                return
+            command = ["sudo", "-n", *command]
+
+        try:
+            self._wayland_input_helper_proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            self._wayland_input_helper_error = str(exc)
+            return
+
+        self._wayland_input_helper_thread = threading.Thread(
+            target=self._read_wayland_input_helper_output,
+            daemon=True,
+            name="WaylandInputHelper",
+        )
+        self._wayland_input_helper_thread.start()
+
+    def _read_wayland_input_helper_output(self) -> None:
+        proc = self._wayland_input_helper_proc
+        if proc is None or proc.stdout is None:
+            return
+
+        try:
+            for line in proc.stdout:
+                self._handle_wayland_input_helper_line(line.rstrip())
+        finally:
+            return_code = proc.wait()
+            if return_code != 0 and self._wayland_input_helper_error is None:
+                self._wayland_input_helper_error = (
+                    f"Wayland input helper exited with status {return_code}"
+                )
+
+    def _handle_wayland_input_helper_line(self, line: str) -> None:
+        if not line:
+            return
+
+        kind, _, payload = line.partition("\t")
+        if kind == "READY":
+            self._wayland_input_ready = True
+            self._refresh_wayland_ready_state()
+            return
+        if kind == "KEY" and payload:
+            self._safe_schedule_wayland_key(payload)
+            return
+        if kind == "CLICK":
+            button_name, _, phase = payload.partition("\t")
+            if button_name and phase:
+                self._safe_schedule_wayland_mouse(button_name, phase)
+            return
+        if kind == "SCROLL":
+            dx_text, _, dy_text = payload.partition("\t")
+            try:
+                self._safe_schedule_wayland_scroll(float(dx_text), float(dy_text))
+            except ValueError:
+                pass
+            return
+        if kind == "ERROR":
+            self._wayland_input_helper_error = payload or line
 
     # ─────────────────────────────── I/O helpers
     def _initialize_gdrive_client(self) -> None:
@@ -912,6 +1414,165 @@ class Screen(Observer):
 
         return path
 
+    async def _capture_initial_state(self, event_ts: float) -> None:
+        await self._update_tracked_regions()
+        tracked_targets = [
+            tracked for tracked in self._tracked_windows if tracked.get("region") is not None
+        ]
+        if not tracked_targets:
+            return
+
+        captured_count = 0
+        for idx, tracked in enumerate(tracked_targets, start=1):
+            monitor_rect = tracked["region"]
+            mss_rect = self._screen_to_mss_coords(monitor_rect)
+            frame = await self._run_in_thread(self._grab_screenshot, mss_rect)
+
+            await self._save_frame(
+                frame,
+                monitor_rect,
+                monitor_rect["width"] / 2,
+                monitor_rect["height"] / 2,
+                f"system_start_win{idx}",
+                highlight=False,
+                event_ts=event_ts,
+            )
+            captured_count += 1
+
+        await self.update_queue.put(
+            Update(
+                content=(
+                    f"system_session_start(status=captured({captured_count}/{len(tracked_targets)}))"
+                ),
+                content_type="input_text",
+                event_ts=event_ts,
+            )
+        )
+
+    async def _capture_wayland_key_event(
+        self,
+        key_name: str,
+        event_ts: float | None = None,
+    ) -> None:
+        if not self._running:
+            return
+
+        await self._update_tracked_regions()
+        tracked_targets = [
+            tracked for tracked in self._tracked_windows if tracked.get("region") is not None
+        ]
+        if not tracked_targets:
+            return
+
+        await self._update_activity_time()
+        event_ts = event_ts if event_ts is not None else time.time()
+        step = f"key_press({key_name})"
+        await self.update_queue.put(
+            Update(content=step, content_type="input_text", event_ts=event_ts)
+        )
+
+        for idx, tracked in enumerate(tracked_targets, start=1):
+            monitor_rect = tracked["region"]
+            mss_rect = self._screen_to_mss_coords(monitor_rect)
+            frame = await self._run_in_thread(self._grab_screenshot, mss_rect)
+            await self._save_frame(
+                frame,
+                monitor_rect,
+                monitor_rect["width"] / 2,
+                monitor_rect["height"] / 2,
+                f"{step}_win{idx}",
+                highlight=False,
+                event_ts=event_ts,
+            )
+
+    @staticmethod
+    def _wayland_pointer_in_region(
+        global_x: float,
+        global_y: float,
+        region: dict,
+    ) -> tuple[float, float, bool]:
+        if (
+            region["left"] <= global_x <= region["left"] + region["width"]
+            and region["top"] <= global_y <= region["top"] + region["height"]
+        ):
+            return global_x - region["left"], global_y - region["top"], True
+
+        return region["width"] / 2, region["height"] / 2, False
+
+    async def _capture_wayland_pointer_event(
+        self,
+        *,
+        action: str,
+        event_ts: float | None = None,
+        scroll: tuple[float, float] | None = None,
+    ) -> None:
+        if not self._running:
+            return
+
+        await self._update_tracked_regions()
+        tracked_targets = [
+            tracked for tracked in self._tracked_windows if tracked.get("region") is not None
+        ]
+        if not tracked_targets:
+            return
+
+        await self._update_activity_time()
+        event_ts = event_ts if event_ts is not None else time.time()
+        global_x, global_y = self._get_wayland_pointer_position()
+        if scroll is None:
+            step = f"{action}({global_x:.1f}, {global_y:.1f})"
+        else:
+            step = (
+                f"scroll({global_x:.1f}, {global_y:.1f}, "
+                f"dx={scroll[0]:.2f}, dy={scroll[1]:.2f})"
+            )
+        await self.update_queue.put(
+            Update(content=step, content_type="input_text", event_ts=event_ts)
+        )
+
+        captured_targets: list[tuple[int, dict, _RawFrame, int | None]] = []
+        for idx, tracked in enumerate(tracked_targets, start=1):
+            monitor_rect = tracked["region"]
+            mss_rect = self._screen_to_mss_coords(monitor_rect)
+            before = await self._run_in_thread(self._grab_screenshot, mss_rect)
+            captured_targets.append(
+                (idx, monitor_rect, before, getattr(before, "sequence", None))
+            )
+
+        await asyncio.sleep(self._after_delay)
+
+        for idx, monitor_rect, before, before_sequence in captured_targets:
+            rel_x, rel_y, highlight = self._wayland_pointer_in_region(
+                global_x,
+                global_y,
+                monitor_rect,
+            )
+            mss_rect = self._screen_to_mss_coords(monitor_rect)
+            after = await self._run_in_thread(
+                self._grab_screenshot,
+                mss_rect,
+                before_sequence,
+                0.3,
+            )
+            await self._save_frame(
+                before,
+                monitor_rect,
+                rel_x,
+                rel_y,
+                f"{step}_before_win{idx}",
+                highlight=highlight,
+                event_ts=event_ts,
+            )
+            await self._save_frame(
+                after,
+                monitor_rect,
+                rel_x,
+                rel_y,
+                f"{step}_after_win{idx}",
+                highlight=highlight,
+                event_ts=event_ts,
+            )
+
     async def _process_and_emit(
         self,
         before_path: str,
@@ -940,6 +1601,7 @@ class Screen(Observer):
 
     async def stop(self) -> None:
         """Stop the observer and clean up resources."""
+        self.stop_listeners_sync()
         await super().stop()
 
         # Clean up frame objects
@@ -999,6 +1661,42 @@ class Screen(Observer):
 
     def stop_listeners_sync(self):
         """Stop pynput listeners synchronously (safe to call from signal handler)"""
+        if self._wayland_capture_helper_proc:
+            try:
+                self._wayland_capture_helper_proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._wayland_capture_helper_proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self._wayland_capture_helper_proc.kill()
+                except Exception:
+                    pass
+            self._wayland_capture_helper_proc = None
+
+        if self._wayland_capture_helper_thread:
+            self._wayland_capture_helper_thread.join(timeout=1)
+            self._wayland_capture_helper_thread = None
+
+        if self._wayland_input_helper_proc:
+            try:
+                self._wayland_input_helper_proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._wayland_input_helper_proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self._wayland_input_helper_proc.kill()
+                except Exception:
+                    pass
+            self._wayland_input_helper_proc = None
+
+        if self._wayland_input_helper_thread:
+            self._wayland_input_helper_thread.join(timeout=1)
+            self._wayland_input_helper_thread = None
+
         if self._mouse_listener:
             try:
                 self._mouse_listener.stop()
@@ -1009,6 +1707,10 @@ class Screen(Observer):
                 self._key_listener.stop()
             except:
                 pass
+
+        if self._wayland_capture_root:
+            shutil.rmtree(self._wayland_capture_root, ignore_errors=True)
+            self._wayland_capture_root = None
 
     # ─────────────────────────────── skip guard
     def _skip(self) -> bool:
@@ -1053,31 +1755,8 @@ class Screen(Observer):
             if self.debug:
                 log.info(f"Recording all monitors")
 
-        # Create and start listeners if not using main thread mode
-        if not self._start_listeners_on_main_thread:
-            if not self._listeners_started:
-                self._mouse_listener = self._mouse_listener_factory()
-                self._key_listener = self._key_listener_factory()
-
-                # Brief delay to let AppKit modal state settle after window selection
-                await asyncio.sleep(0.1)
-
-                self._mouse_listener.start()
-                self._key_listener.start()
-                self._listeners_started = True
-
-        # Wait for listeners to be started (might be on main thread)
-        wait_time = 0
-        while not self._listeners_started and wait_time < 10:
-            await asyncio.sleep(0.1)
-            wait_time += 0.1
-
-        if not self._listeners_started:
-            log.error("Listeners not started after 10 seconds")
-            return
-
-        mouse_listener = self._mouse_listener
-        key_listener = self._key_listener
+        mouse_listener = None
+        key_listener = None
 
         # ---- nested helper inside the async context ----
         async def flush():
@@ -1107,7 +1786,12 @@ class Screen(Observer):
             # Convert screen coordinates to mss coordinates
             mss_rect = self._screen_to_mss_coords(mon_rect)
             try:
-                aft = await self._run_in_thread(self._grab_screenshot, mss_rect)
+                aft = await self._run_in_thread(
+                    self._grab_screenshot,
+                    mss_rect,
+                    ev.get("before_sequence") if self._is_wayland else None,
+                    0.3 if self._is_wayland else 0.0,
+                )
             except Exception as e:
                 if self.debug:
                     logging.getLogger("Screen").error(
@@ -1230,6 +1914,7 @@ class Screen(Observer):
                 "position": (rel_x, rel_y),
                 "mon": idx,
                 "before": bf,
+                "before_sequence": getattr(bf, "sequence", None),
                 "monitor_rect": mon,
                 "event_ts": event_ts,
             }
@@ -1238,7 +1923,7 @@ class Screen(Observer):
         # ---- keyboard event reception ----
         async def _handle_key_event(key, typ: str):
             # Get current mouse position to determine active window
-            x, y = mouse.Controller().position
+            x, y = self._get_pointer_position()
 
             # Convert pynput coordinates to screen coordinates
             if IS_MACOS:
@@ -1337,6 +2022,47 @@ class Screen(Observer):
                 if len(self._key_screenshots) > 2:
                     asyncio.create_task(self._cleanup_key_screenshots())
 
+        async def _handle_wayland_key_event(key_name: str):
+            try:
+                await self._capture_wayland_key_event(key_name)
+            except Exception as exc:
+                if self.debug:
+                    log.error(f"Failed to capture Wayland key event: {exc}")
+
+        async def _handle_wayland_mouse_event(button_name: str, phase: str):
+            if phase != "down":
+                return
+            try:
+                await self._capture_wayland_pointer_event(action=button_name)
+            except Exception as exc:
+                if self.debug:
+                    log.error(f"Failed to capture Wayland mouse event: {exc}")
+
+        async def _handle_wayland_scroll_event(dx: float, dy: float):
+            global_x, global_y = self._get_wayland_pointer_position()
+            async with self._scroll_lock:
+                if not self._should_log_scroll(global_x, global_y, dx, dy):
+                    if self.debug:
+                        log.info(f"Wayland scroll filtered out: dx={dx:.2f}, dy={dy:.2f}")
+                    return
+
+            scroll_magnitude = (dx**2 + dy**2) ** 0.5
+            if scroll_magnitude < 1.0:
+                if self.debug:
+                    log.info(
+                        f"Wayland scroll too small: magnitude={scroll_magnitude:.2f}"
+                    )
+                return
+
+            try:
+                await self._capture_wayland_pointer_event(
+                    action="scroll",
+                    scroll=(dx, dy),
+                )
+            except Exception as exc:
+                if self.debug:
+                    log.error(f"Failed to capture Wayland scroll event: {exc}")
+
         # ---- scroll event reception ----
         async def _handle_scroll_event(x: float, y: float, dx: float, dy: float):
             # Convert pynput coordinates to screen coordinates
@@ -1409,6 +2135,7 @@ class Screen(Observer):
                 "position": (rel_x, rel_y),
                 "mon": idx,
                 "before": bf,
+                "before_sequence": getattr(bf, "sequence", None),
                 "scroll": (dx, dy),
                 "monitor_rect": mon,
                 "event_ts": event_ts,
@@ -1422,6 +2149,43 @@ class Screen(Observer):
         self._mouse_handler = _handle_mouse_event
         self._scroll_handler = _handle_scroll_event
         self._key_handler = _handle_key_event
+        self._wayland_key_handler = _handle_wayland_key_event
+        self._wayland_mouse_handler = _handle_wayland_mouse_event
+        self._wayland_scroll_handler = _handle_wayland_scroll_event
+
+        # Create and start listeners once handlers are ready.
+        if not self._start_listeners_on_main_thread and not self._listeners_started:
+            if self._is_wayland:
+                self._start_wayland_capture_helper()
+                self._start_wayland_input_helper()
+            else:
+                self._mouse_listener = self._mouse_listener_factory()
+                self._key_listener = self._key_listener_factory()
+
+                # Brief delay to let AppKit modal state settle after window selection
+                await asyncio.sleep(0.1)
+
+                self._mouse_listener.start()
+                self._key_listener.start()
+                self._listeners_started = True
+
+        # Wait for listeners to be started (might be on main thread)
+        wait_time = 0.0
+        while not self._listeners_started and wait_time < 10:
+            if self._wayland_input_helper_error or self._wayland_capture_error:
+                break
+            await asyncio.sleep(0.1)
+            wait_time += 0.1
+
+        if not self._listeners_started:
+            helper_error_value = self._wayland_capture_error or self._wayland_input_helper_error
+            helper_error = f": {helper_error_value}" if helper_error_value else ""
+            log.error(f"Listeners not started after 10 seconds{helper_error}")
+            self._running = False
+            return
+
+        mouse_listener = self._mouse_listener
+        key_listener = self._key_listener
 
         # ---- main capture loop ----
         log.info(f"Screen observer started — guarding {self._guard or '∅'}")
@@ -1433,8 +2197,24 @@ class Screen(Observer):
         async with self._inactivity_lock:
             self._last_activity_time = time.time()
 
+        if self._is_wayland:
+            try:
+                await self._capture_initial_state(time.time())
+            except Exception as exc:
+                if self.debug:
+                    log.error(f"Failed to capture initial Wayland state: {exc}")
+
         while self._running:  # flag from base class
             t0 = time.time()
+
+            if self._wayland_capture_error or self._wayland_input_helper_error:
+                log.error(
+                    "Stopping recording after Wayland helper failure: %s",
+                    self._wayland_capture_error or self._wayland_input_helper_error,
+                )
+                self.stop_listeners_sync()
+                self._running = False
+                break
 
             # Check for inactivity timeout
             async with self._inactivity_lock:
@@ -1522,8 +2302,12 @@ class Screen(Observer):
         # Shutdown listeners if started in async worker
         # (main thread listeners are stopped via stop_listeners_sync)
         if not self._start_listeners_on_main_thread:
-            mouse_listener.stop()
-            key_listener.stop()
+            if mouse_listener is not None:
+                mouse_listener.stop()
+            if key_listener is not None:
+                key_listener.stop()
+            if self._is_wayland:
+                self.stop_listeners_sync()
 
         # Final cleanup of any remaining keyboard session
         if self._key_activity_start is not None and len(self._key_screenshots) > 1:

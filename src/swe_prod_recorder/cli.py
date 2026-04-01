@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import platform
 import signal
 import sys
 import threading
@@ -9,18 +10,21 @@ import threading
 # pynput's MouseListener tries to lazily import AXIsProcessTrusted in a background thread,
 # which fails due to pyobjc's lazy import not being thread-safe. We pre-load it here on the
 # main thread before any listeners start.
-try:
-    from ApplicationServices import AXIsProcessTrusted as _AXIsProcessTrusted
-    from pynput._util import darwin
+if platform.system() == "Darwin":
+    try:
+        from ApplicationServices import AXIsProcessTrusted as _AXIsProcessTrusted
+        from pynput._util import darwin
 
-    # Force the lazy load now on main thread
-    if hasattr(darwin, 'HIServices') and hasattr(darwin.HIServices, 'AXIsProcessTrusted'):
-        _ = darwin.HIServices.AXIsProcessTrusted()
-    elif hasattr(darwin, 'HIServices'):
-        darwin.HIServices.AXIsProcessTrusted = _AXIsProcessTrusted
-
-except Exception as e:
-    print(f"Warning: Could not pre-load AXIsProcessTrusted: {e}")
+        # Force the lazy load now on main thread
+        if hasattr(darwin, "HIServices") and hasattr(
+            darwin.HIServices,
+            "AXIsProcessTrusted",
+        ):
+            _ = darwin.HIServices.AXIsProcessTrusted()
+        elif hasattr(darwin, "HIServices"):
+            darwin.HIServices.AXIsProcessTrusted = _AXIsProcessTrusted
+    except Exception as e:
+        print(f"Warning: Could not pre-load AXIsProcessTrusted: {e}")
 
 from .gum import gum
 from .observers import Screen
@@ -74,7 +78,12 @@ def parse_args():
     return parser.parse_args()
 
 
-async def _async_main(screen_observer, stop_event, data_directory):
+async def _async_main(
+    screen_observer,
+    stop_event,
+    data_directory,
+    checkpoint_db_on_exit=False,
+):
     """Run async event loop in background thread.
 
     This manages the database, observer workers, and update processing.
@@ -82,9 +91,17 @@ async def _async_main(screen_observer, stop_event, data_directory):
     user_name = "anonymous"  # Default user name
 
     try:
-        async with gum(user_name, screen_observer, data_directory=data_directory):
+        async with gum(
+            user_name,
+            screen_observer,
+            data_directory=data_directory,
+            checkpoint_db_on_exit=checkpoint_db_on_exit,
+        ):
             # Wait for stop signal
             while not stop_event.is_set():
+                if not screen_observer._running:
+                    stop_event.set()
+                    break
                 await asyncio.sleep(0.1)
     except Exception as e:
         print(f"Error in async loop: {e}")
@@ -107,14 +124,36 @@ def main():
     # Window selection is not supported with multiple monitors — force --all
     if not args.record_all_screens:
         import mss
+
         with mss.mss() as sct:
-            num_monitors = len(sct.monitors) - 1  # monitors[0] is the virtual combined monitor
+            num_monitors = (
+                len(sct.monitors) - 1
+            )  # monitors[0] is the virtual combined monitor
         if num_monitors > 1:
-            print(f"\n⚠️  Multiple monitors detected ({num_monitors}). "
-                  "Window selection is not supported with multiple monitors.")
+            print(
+                f"\n⚠️  Multiple monitors detected ({num_monitors}). "
+                "Window selection is not supported with multiple monitors."
+            )
             print("Falling back to --all (recording all screens).")
             input("\nPress Enter to continue...")
             args.record_all_screens = True
+
+    current_platform = platform.system()
+    is_macos = current_platform == "Darwin"
+    is_linux = current_platform == "Linux"
+    is_wayland = is_linux and (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+    if is_wayland and os.geteuid() == 0:
+        print("Run `swe-prod-recorder` as your user, not as root, on Wayland.")
+        print("The recorder will request sudo only for /dev/input if needed.")
+        sys.exit(1)
+
+    # Default to --all on Linux
+    if is_linux and not args.record_all_screens:
+        args.record_all_screens = True
 
     if args.upload_to_gdrive:
         try:
@@ -154,6 +193,19 @@ def main():
             print(f"❌ Google Drive authentication failed: {exc}")
             sys.exit(1)
 
+    data_directory = f"data/pr_{args.pr}"
+    screenshots_dir = f"{data_directory}/screenshots"
+    screen_observer = Screen(
+        upload_to_gdrive=args.upload_to_gdrive,
+        record_all_screens=args.record_all_screens,
+        inactivity_timeout=args.inactivity_timeout * 60,
+        debug=args.debug,
+        start_listeners_on_main_thread=is_macos,
+        screenshots_dir=screenshots_dir,
+    )
+    if is_wayland:
+        screen_observer.poll_wayland_cursor_position()
+
     # Display user warning and instructions
     print("\n" + "=" * 70)
     print("⚠️  BEFORE YOU BEGIN RECORDING")
@@ -179,32 +231,36 @@ def main():
     print("don't want to share.")
     print("\n" + "=" * 70)
 
-    input("\nPress Enter to confirm and start recording...")
+    if is_wayland and screen_observer.needs_wayland_input_helper():
+        print("\nWayland input capture may need temporary sudo access to /dev/input.")
+        if not screen_observer.preflight_wayland_input_helper():
+            print("Wayland input helper authorization was not completed.")
+            sys.exit(1)
+
+    try:
+        input("\nPress Enter to confirm and start recording...")
+    except KeyboardInterrupt:
+        print("\n\nShutting down...")
+        sys.exit(130)
     # print("\nStarting recording...\n")
 
-    # Set data directory based on PR number
-    data_directory = f"data/pr_{args.pr}"
-    screenshots_dir = f"{data_directory}/screenshots"
     print(f"\n📁 Data will be saved to: {data_directory}/")
-
-    # Create screen observer (window selection happens on main thread)
-    screen_observer = Screen(
-        upload_to_gdrive=args.upload_to_gdrive,
-        record_all_screens=args.record_all_screens,
-        inactivity_timeout=args.inactivity_timeout * 60,
-        debug=args.debug,
-        start_listeners_on_main_thread=True,  # macOS-safe mode
-        screenshots_dir=screenshots_dir,
-    )
 
     # Coordination between main and background threads
     stop_event = threading.Event()
 
     # Launch asyncio event loop in background thread
     async_thread = threading.Thread(
-        target=lambda: asyncio.run(_async_main(screen_observer, stop_event, data_directory)),
+        target=lambda: asyncio.run(
+            _async_main(
+                screen_observer,
+                stop_event,
+                data_directory,
+                checkpoint_db_on_exit=is_wayland,
+            )
+        ),
         daemon=True,
-        name="AsyncIOThread"
+        name="AsyncIOThread",
     )
     async_thread.start()
 
@@ -217,16 +273,24 @@ def main():
         print("\n\nShutting down...")
         stop_event.set()
         screen_observer.stop_listeners_sync()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        # Run pynput listeners on main thread (blocks until stopped)
-        screen_observer.run_listeners_on_main_thread()
+        if is_macos:
+            # Run pynput listeners on main thread (blocks until stopped)
+            screen_observer.run_listeners_on_main_thread()
+        else:
+            import time
+
+            while async_thread.is_alive() and not stop_event.is_set():
+                if is_wayland:
+                    screen_observer.poll_wayland_cursor_position()
+                time.sleep(0.1)
 
         # Clean shutdown
         stop_event.set()
+        screen_observer.stop_listeners_sync()
         async_thread.join(timeout=5)
 
     except KeyboardInterrupt:

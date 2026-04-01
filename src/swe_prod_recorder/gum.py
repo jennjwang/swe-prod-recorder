@@ -5,6 +5,8 @@ import os
 from contextlib import asynccontextmanager
 from typing import Callable
 
+from sqlalchemy import text as sql_text
+
 from .models import Observation, init_db
 from .observers import Observer
 from .schemas import Update
@@ -19,6 +21,7 @@ class gum:
         db_name: str = "actions.db",
         max_concurrent_updates: int = 4,
         verbosity: int = logging.INFO,
+        checkpoint_db_on_exit: bool = False,
     ):
         # basic paths
         data_directory = os.path.expanduser(data_directory)
@@ -42,6 +45,7 @@ class gum:
         self.Session = None
         self._db_name = db_name
         self._data_directory = data_directory
+        self._checkpoint_db_on_exit = checkpoint_db_on_exit
 
         self._update_sem = asyncio.Semaphore(max_concurrent_updates)
         self._tasks: set[asyncio.Task] = set()
@@ -76,11 +80,16 @@ class gum:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        if self._checkpoint_db_on_exit:
+            await self._drain_pending_updates(timeout=1.0)
         await self.stop_update_loop()
 
         # wait for any in-flight handlers
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        if self._checkpoint_db_on_exit:
+            await self._checkpoint_and_close_db()
 
         # stop observers
         for obs in self.observers:
@@ -115,6 +124,28 @@ class gum:
                 await self._default_handler(observer, update)
             finally:
                 self._tasks.discard(asyncio.current_task())
+
+    async def _drain_pending_updates(self, timeout: float) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            queues_empty = all(obs.update_queue.empty() for obs in self.observers)
+            if queues_empty and not self._tasks:
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                return
+            await asyncio.sleep(0.05)
+
+    async def _checkpoint_and_close_db(self) -> None:
+        if self.engine is None:
+            return
+
+        try:
+            async with self.engine.connect() as conn:
+                await conn.execute(sql_text("PRAGMA wal_checkpoint(TRUNCATE)"))
+        finally:
+            await self.engine.dispose()
+            self.engine = None
+            self.Session = None
 
     async def _handle_audit(self, obs: Observation) -> bool:
         return False

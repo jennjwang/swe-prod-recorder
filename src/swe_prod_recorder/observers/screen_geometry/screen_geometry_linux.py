@@ -1,8 +1,56 @@
-"""Linux-specific screen geometry helpers using X11 and mss APIs."""
+"""Linux-specific screen geometry helpers using X11, Qt, and mss APIs."""
 
+import os
+import sys
 from typing import List, Optional, Tuple
 
 import mss
+
+
+def _is_wayland_session() -> bool:
+    return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or bool(
+        os.environ.get("WAYLAND_DISPLAY")
+    )
+
+
+def _get_qt_application():
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv[:1])
+        app.setQuitOnLastWindowClosed(False)
+    return app
+
+
+def get_monitor_regions() -> List[dict[str, int]]:
+    """Return monitor geometries in screen coordinates (Y=0 at top)."""
+    if _is_wayland_session():
+        app = _get_qt_application()
+        screens = sorted(
+            app.screens(),
+            key=lambda screen: (screen.geometry().x(), screen.geometry().y()),
+        )
+        return [
+            {
+                "left": geometry.x(),
+                "top": geometry.y(),
+                "width": geometry.width(),
+                "height": geometry.height(),
+            }
+            for geometry in (screen.geometry() for screen in screens)
+        ]
+
+    with mss.mss() as sct:
+        return [
+            {
+                "left": monitor["left"],
+                "top": monitor["top"],
+                "width": monitor["width"],
+                "height": monitor["height"],
+            }
+            for monitor in sct.monitors[1:]
+        ]
 
 
 def get_global_bounds() -> Tuple[float, float, float, float]:
@@ -12,18 +60,17 @@ def get_global_bounds() -> Tuple[float, float, float, float]:
     -------
     (min_x, min_y, max_x, max_y) tuple in X11 coordinates (Y=0 at top).
     """
-    with mss.mss() as sct:
-        min_x = min_y = float("inf")
-        max_x = max_y = -float("inf")
-        # Skip monitor 0 (all monitors combined)
-        for monitor in sct.monitors[1:]:
-            x0 = monitor["left"]
-            y0 = monitor["top"]
-            x1 = x0 + monitor["width"]
-            y1 = y0 + monitor["height"]
-            min_x, min_y = min(min_x, x0), min(min_y, y0)
-            max_x, max_y = max(max_x, x1), max(max_y, y1)
-        return min_x, min_y, max_x, max_y
+    monitors = get_monitor_regions()
+    min_x = min_y = float("inf")
+    max_x = max_y = -float("inf")
+    for monitor in monitors:
+        x0 = monitor["left"]
+        y0 = monitor["top"]
+        x1 = x0 + monitor["width"]
+        y1 = y0 + monitor["height"]
+        min_x, min_y = min(min_x, x0), min(min_y, y0)
+        max_x, max_y = max(max_x, x1), max(max_y, y1)
+    return min_x, min_y, max_x, max_y
 
 
 def get_visible_windows() -> List[Tuple[dict, float]]:
@@ -178,4 +225,3 @@ def convert_quartz_region_to_screen(region: dict) -> dict:
         {'left': x, 'top': y, 'width': w, 'height': h} in screen coordinates (no conversion needed)
     """
     return region.copy()
-
